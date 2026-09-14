@@ -132,5 +132,28 @@ DSH 的 `pwsh` 工具**只有基础设施错误**（spawn 失败/中止）才标
 | mcpLazy | 24 个 MCP 工具 schema ≈ 9,362 token 拦在请求外 |
 | 缓存命中率 | 长会话常态 **97%–99.3%**（单次最优样本 99.75%）；小会话 ~68% |
 | parallelConvergence | 失败→池压 1；连续 3 次成功→恢复原值；跨进程持久化还原 |
+
+## 手动 /compact 与插件自动分层压缩的关系(v2.2 新增)
+
+**分层压缩(layeredCompact)三级动作与无损性**(默认 enabled:false;启用时自动旁路旧 compactionDriver):
+
+| 层 | 触发 | 真动作 | 无损性 |
+|---|---|---|---|
+| L0 观测层 | 压力比 ≥ lowRatio(0.4) | 只记账(/token-status 显示"观测区"),**不降压力** | — |
+| L1 无损层 | ≥ midRatio(0.5) | `ctx.toolResultPruner.pruneSession(session)` + tokenMeter 复测;复测后 savedTokens 记账,0 效果如实记 pruneNoop | ✅ 无损(surface 级替换,原文可回放、被遮蔽节点已 cite) |
+| L2 有损层 | ≥ highRatio(0.65) **且 L1 复测后仍超阈** | `compaction.compactNow`(超时保护;按 err.code 分类记账;busy → 本会话退避) | ❌ 有损(LLM 摘要替换历史,原文仅在 append-only 日志) |
+
+**口径要点**:
+- 本插件的 fileDiff / outputLadder 是**投影级**(tools/post-execute 替换,只影响未来进入模型的结果);
+  L1 的 pruneSession 是 **surface 级**(改写已发送历史)——这正是它能真降当前压力的原因。
+  "不改写已发送历史"只对投影层成立,不是全局事实。
+- 与内核 `compaction-basic` 的边界:内核自带 0.8 阈值、且它自己也是**先 prune 再复测再决定是否有损**
+  的两段式(dsh-compaction-basic/lib/index.js:900-905);对 1M 窗口它几乎不自触发。
+  本插件的 L1 提前到 0.5 打 prune,正是把内核"先无损后有损"的机会从 0.8 提前拿过来。
+- 与手动 `/compact` 的关系:唯一互斥是内核压缩锁(ManualCompactionError busy)+ L2 侧的
+  会话退避(L2 遇 busy 视为"手动/其他压缩正在进行",本会话不再自动有损压缩,实现位置
+  layeredCompact state.backedOff);L0/L1 不受退避影响。
+- 旧 compactionDriver(0.45 阈值、命中即有损)在 layeredCompact 启用时被 src/index.js 自动旁路。
+
 ---
 *贡献者：Zoria-Lind*

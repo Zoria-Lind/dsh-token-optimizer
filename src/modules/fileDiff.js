@@ -122,7 +122,10 @@ export function createFileDiffModule(ctx, config, stats) {
     const path = pathOf(exec)
     if (!path) return decision
 
-    const blocks = result?.content
+    // T7(层序敏感写法):以 decision.content ?? result.content 为基线——
+    // 更内层 handler 可能已改写 content,基线取 decision 才不会覆盖内层改写;
+    // 返回 spread decision,保留 additionalContexts 等下游字段。
+    const blocks = decision.content ?? result?.content
     const text = toText(blocks)
     if (text.length < config.minSize) return decision
     if (Buffer.byteLength(text, 'utf8') > config.maxFileBytes) return decision // 太大,放弃,放行
@@ -149,8 +152,9 @@ export function createFileDiffModule(ctx, config, stats) {
       if (replacement.length >= text.length) return decision
       stats?.bump('filediff.unchanged', 1)
       stats?.addSample({ module: 'filediff', tool: name, savedChars: text.length - replacement.length })
+      // T7:spread decision 透传 additionalContexts 等;content 以基线重建
       return {
-        kind: 'accept',
+        ...decision,
         content: foldTextBlocks(blocks, replacement),
       }
     }
@@ -164,8 +168,9 @@ export function createFileDiffModule(ctx, config, stats) {
     if (replacement.length >= text.length) return decision
     stats?.bump('filediff.changed', 1)
     stats?.addSample({ module: 'filediff', tool: name, savedChars: text.length - replacement.length })
+    // T7:spread decision 透传 additionalContexts 等;content 以基线重建
     return {
-      kind: 'accept',
+      ...decision,
       content: foldTextBlocks(blocks, replacement),
     }
   }

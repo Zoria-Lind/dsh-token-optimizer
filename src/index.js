@@ -34,6 +34,8 @@ import { createMonitorModule } from './modules/monitor.js'
 import { createFileDiffModule } from './modules/fileDiff.js'
 import { createToolTrimModule } from './modules/toolTrim.js'
 import { createCompactionDriverModule } from './modules/compactionDriver.js'
+import { createLayeredCompactModule } from './modules/layeredCompact.js'
+import { registerTokenStatusCommand } from './commands/tokenStatus.js'
 import { createStats } from './stats.js'
 import { appendFileSync } from 'node:fs'
 
@@ -60,7 +62,19 @@ export function apply(ctx, config = {}) {
   if (resolved.monitor.enabled) modules.push(createMonitorModule(ctx, resolved.monitor, stats))
   if (resolved.fileDiff.enabled) modules.push(createFileDiffModule(ctx, resolved.fileDiff, stats))
   if (resolved.toolTrim.enabled) modules.push(createToolTrimModule(ctx, resolved.toolTrim, stats))
-  if (resolved.compactionDriver.enabled) modules.push(createCompactionDriverModule(ctx, resolved.compactionDriver, stats))
+  // T4:compactionDriver 与 layeredCompact 互斥(旁路)。旧驱动 0.45 命中即有损,
+  // 会把 L1 无损层(pruneSession)的机会整个吃掉——layeredCompact.enabled=true 时
+  // 必须关闭 compactionDriver,分层才成立。
+  if (resolved.layeredCompact.enabled) {
+    if (resolved.compactionDriver.enabled) {
+      console.warn('[dsh-token-optimizer] layeredCompact 已启用,自动旁路 compactionDriver(旧驱动 0.45 命中即有损,会吃掉 L1 无损层的机会)')
+    }
+    modules.push(createLayeredCompactModule(ctx, resolved.layeredCompact, stats))
+  } else if (resolved.compactionDriver.enabled) {
+    modules.push(createCompactionDriverModule(ctx, resolved.compactionDriver, stats))
+  }
+  // T5:可观测命令(observability,常开;observability 不改变行为)
+  modules.push(registerTokenStatusCommand(ctx, resolved.layeredCompact, stats))
   // 插件卸载时清理所有注册的钩子
   return () => {
     for (const cleanup of modules) cleanup()

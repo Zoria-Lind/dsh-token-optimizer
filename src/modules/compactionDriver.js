@@ -14,6 +14,54 @@
 // 失败分类:
 //   busy/cancelled(ManualCompactionError)→ 回退计数,下次 idle 重试
 //   其余 → failed 计数,不重试(仍受 max 封顶)
+// T3 新增:错误按 err.code 细分记账(failed.<code>);runCompaction 回传结果;
+// computePressure 导出(T4 编排与 T5 命令共用同一口径)。
+
+// 窗口口径(T3/07 §A):tokenMeter.measure() 不返回 contextWindow——窗口只能扫
+// 会话日志里最新的 request/context 事件;取不到则用 fallback 并标记来源
+// (fallback 不是实测值:1e6 与路由默认 262144 差 4 倍,把回落值当实测会整体错位)。
+function latestContextEvent(session) {
+  const events = session?.events
+  if (!Array.isArray(events)) return null
+  for (let i = events.length - 1; i >= 0; i--) {
+    const e = events[i]
+    if (e?.type === 'request/context' && typeof e?.data?.contextWindow === 'number') return e
+  }
+  return null
+}
+
+// 上下文窗口:优先读会话日志里最新的 request/context 事件(真实窗口),否则用配置
+function contextWindowOf(session, fallback) {
+  return latestContextEvent(session)?.data.contextWindow ?? fallback
+}
+
+// 压力比统一口径(第一参传 ctx 而非 tokenMeter 实例:调用方都拿得到 ctx,签名统一)。
+// 返回 null 的情况:ctx 上拿不到 tokenMeter / measure 抛错 / totalTokens 非数字。
+// 窗口来源标记 windowSource: 'event'(实测)| 'fallback'(回落值,仅兜底口径)。
+export function computePressure(ctx, session, fallbackWindow = 262144) {
+  let meter
+  try {
+    meter = ctx?.get?.('tokenMeter')
+  } catch {
+    return null
+  }
+  if (!meter || typeof meter.measure !== 'function') return null
+  let totalTokens
+  try {
+    totalTokens = meter.measure(session)?.totalTokens
+  } catch {
+    return null
+  }
+  if (typeof totalTokens !== 'number') return null
+  const event = latestContextEvent(session)
+  const window = event ? event.data.contextWindow : fallbackWindow
+  return {
+    totalTokens,
+    window,
+    windowSource: event ? 'event' : 'fallback',
+    ratio: window > 0 ? totalTokens / window : 0,
+  }
+}
 
 export function createCompactionDriverModule(ctx, config, stats) {
   if (!config?.enabled) return () => {}
@@ -81,18 +129,6 @@ export function createCompactionDriverModule(ctx, config, stats) {
     return n
   }
 
-  // 上下文窗口:优先读会话日志里最新的 request/context 事件(真实窗口),否则用配置
-  function contextWindowOf(session, fallback) {
-    const events = session?.events
-    if (Array.isArray(events)) {
-      for (let i = events.length - 1; i >= 0; i--) {
-        const e = events[i]
-        if (e?.type === 'request/context' && typeof e?.data?.contextWindow === 'number') return e.data.contextWindow
-      }
-    }
-    return fallback
-  }
-
   async function runCompaction(agent, state) {
     const signal = AbortSignal.timeout(config.timeoutMs)
     try {
@@ -100,21 +136,29 @@ export function createCompactionDriverModule(ctx, config, stats) {
       const result = await compaction.compactNow(agent, signal)
       if (result === null) {
         // 无可用压缩区段:计为已用次数,不立即重试(防每轮空转),由 max 封顶
-        return
+        stats?.bump('compactionDriver.code.noop', 1)
+        return { ok: false, code: 'noop' }
       }
       stats?.bump('compactionDriver.completed', 1)
       console.log(`[dsh-token-optimizer] compactionDriver 压缩完成:agent "${agent?.id ?? '?'}" 历史已替换为摘要(原文可回放)`)
+      return { ok: true }
     } catch (err) {
       const code = err?.code
       if (code === 'busy' || code === 'cancelled') {
         // 与用户手动 /compact 并发(busy)或本插件超时/中止(cancelled):
-        // 回退计数,下次 idle 重试
+        // 回退计数,下次 idle 重试。注意:AbortSignal.timeout 的超时是普通 abort,
+        // 不是 cancelled(cancelled 只在 agent 自身信号中止时出现,07 §A)
         stats?.bump('compactionDriver.skippedBusy', 1)
+        stats?.bump(`compactionDriver.code.${code}`, 1)
         state.compactionsDone = Math.max(0, state.compactionsDone - 1)
-      } else {
-        stats?.bump('compactionDriver.failed', 1)
-        console.warn(`[dsh-token-optimizer] compactionDriver 压缩失败:${err?.message ?? err}`)
+        return { ok: false, code }
       }
+      // 按 err.code 细分记账(busy/cancelled/changed/summary/commit/persistence),
+      // 不再用一个笼统 failed 把"一次都没压过"伪装成"刚压过"
+      stats?.bump('compactionDriver.failed', 1)
+      stats?.bump(`compactionDriver.failed.${code ?? 'unknown'}`, 1)
+      console.warn(`[dsh-token-optimizer] compactionDriver 压缩失败(${code ?? 'unknown'}):${err?.message ?? err}`)
+      return { ok: false, code: code ?? 'unknown' }
     } finally {
       state.inFlight = false
     }

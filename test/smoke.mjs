@@ -12,7 +12,9 @@ import { createMonitorModule } from '../src/modules/monitor.js'
 import { createFileDiffModule } from '../src/modules/fileDiff.js'
 import { createToolTrimModule } from '../src/modules/toolTrim.js'
 import { createOutputLadderModule } from '../src/modules/outputLadder.js'
-import { createCompactionDriverModule } from '../src/modules/compactionDriver.js'
+import { createCompactionDriverModule, computePressure } from '../src/modules/compactionDriver.js'
+import { createLayeredCompactModule } from '../src/modules/layeredCompact.js'
+import { registerTokenStatusCommand } from '../src/commands/tokenStatus.js'
 
 let failures = 0
 function check(name, cond) {
@@ -25,14 +27,34 @@ function check(name, cond) {
 }
 
 function makeFakeCtx() {
-  const handlers = new Map()
+  // waterfall 组合语义(0A §D2 实测):最外层返回值唯一有效;
+  // prepend 之间后注册者更外层;默认之间先注册者更外层
+  const handlers = new Map() // event -> [{fn}] 按执行顺序(最外层在前)
   return {
-    on(event, handler) { handlers.set(event, handler) },
-    off(event, handler) { if (handlers.get(event) === handler) handlers.delete(event) },
+    on(event, handler, opts) {
+      const arr = handlers.get(event) ?? []
+      if (opts && opts.prepend) arr.unshift({ fn: handler })
+      else arr.push({ fn: handler })
+      handlers.set(event, arr)
+      return () => this.off(event, handler)
+    },
+    off(event, handler) {
+      const arr = handlers.get(event)
+      if (!arr) return
+      const i = arr.findIndex((h) => h.fn === handler)
+      if (i >= 0) arr.splice(i, 1)
+    },
     async emit(event, ...args) {
-      const h = handlers.get(event)
-      if (!h) throw new Error(`no handler for ${event}`)
-      return h(...args)
+      const arr = handlers.get(event)
+      if (!arr || arr.length === 0) throw new Error(`no handler for ${event}`)
+      // 测试把"终止 next"作为最后一个参数传入(内核同款调用形状)→ 它是链条终点
+      const terminal = typeof args[args.length - 1] === 'function' ? args[args.length - 1] : null
+      const baseArgs = terminal ? args.slice(0, -1) : args
+      const run = async (i, a) => {
+        if (i >= arr.length) return terminal ? terminal(...a) : undefined
+        return arr[i].fn(...a, (...na) => run(i + 1, na.length ? na : a))
+      }
+      return run(0, baseArgs)
     },
   }
 }
@@ -871,6 +893,256 @@ console.log('== toolGate mcpLazy ==')
     await tick()
     check('toolGate tools/change 无变化不重挂(防死循环)', restricted.length === afterCreated)
   }
+}
+
+console.log('')
+
+// ===== v2.2 迭代(T1/T2/T3/T4/T5/T7)测试 =====
+
+console.log('== T1 layeredCompact 配置地基 ==')
+{
+  const cfg = resolveConfig({})
+  check('T1:默认 enabled=false(灰度)', cfg.layeredCompact.enabled === false)
+  check('T1:三层默认比值 0.4/0.5/0.65', cfg.layeredCompact.lowRatio === 0.4 && cfg.layeredCompact.midRatio === 0.5 && cfg.layeredCompact.highRatio === 0.65)
+  check('T1:sessionWindowFallback 默认 262144(与路由缺省同值)', cfg.layeredCompact.sessionWindowFallback === 262144)
+  check('T1:pricing 默认三价(0.8/0.23/2.8 元每百万)', cfg.layeredCompact.pricing.inputPerMillion === 0.8 && cfg.layeredCompact.pricing.cacheHitPerMillion === 0.23 && cfg.layeredCompact.pricing.outputPerMillion === 2.8)
+  let threw = false
+  try { resolveConfig({ layeredCompact: { lowRatio: 1.5 } }) } catch (e) { threw = /lowRatio/.test(e?.message ?? '') }
+  check('T1:lowRatio=1.5 抛错且错误信息含 lowRatio', threw)
+  threw = false
+  try { resolveConfig({ layeredCompact: { lowRato: 1.5 } }) } catch (e) { threw = /lowRato/.test(e?.message ?? '') }
+  check('T1:未知键 lowRato 抛错(错误信息含键名)', threw)
+  threw = false
+  try { resolveConfig({ layeredCompact: { pricing: { inputPerMillion: 'x', cacheHitPerMillion: 0.23, outputPerMillion: 2.8 } } }) } catch (e) { threw = /pricing\.inputPerMillion/.test(e?.message ?? '') }
+  check('T1:pricing 非数字值抛错(浅校验补丁)', threw)
+  const userPricing = { inputPerMillion: 0.9, cacheHitPerMillion: 0.2, outputPerMillion: 3 }
+  const frozen = resolveConfig({ layeredCompact: { pricing: userPricing } }).layeredCompact.pricing
+  check('T1:pricing 校验后返回深拷贝并冻结(内外解耦)', frozen !== userPricing && Object.isFrozen(frozen))
+}
+
+console.log('== T2 stats 分桶与估算 ==')
+{
+  const stats = createStats()
+  const b1 = stats.bucket('s1')
+  const b2 = stats.bucket('s2')
+  b1.bump('layeredCompact.lossy', 2)
+  b2.bump('layeredCompact.lossy', 5)
+  b1.addSample({ module: 'layeredCompact', savedChars: 10 })
+  const s1 = stats.snapshotSession('s1')
+  const s2 = stats.snapshotSession('s2')
+  check('T2:snapshotSession 与 snapshot 同构{counters,samples}', typeof s1.counters === 'object' && Array.isArray(s1.samples))
+  check('T2:两会话交替写入后互不串味', s1.counters['layeredCompact.lossy'] === 2 && s2.counters['layeredCompact.lossy'] === 5)
+  check('T2:全局计数不受分桶影响', stats.snapshot().counters['layeredCompact.lossy'] === undefined)
+  check('T2:estimateTokens 换算(1600 字符 ≈ 1000 token;非法输入 0)', stats.estimateTokens(1600) === 1000 && stats.estimateTokens(-5) === 0)
+  check('T2:estimateCost 数值正确(1M 输入=0.8 元;1M 缓存=0.23 元)', stats.estimateCost({ inputTokens: 1e6 }) === 0.8 && stats.estimateCost({ cacheReadTokens: 1e6 }) === 0.23)
+}
+
+console.log('== T3 computePressure ==')
+{
+  const session = { events: [{ type: 'request/context', data: { contextWindow: 262144 } }] }
+  const ctxP = { get: (k) => (k === 'tokenMeter' ? { measure: () => ({ totalTokens: 131072 }) } : undefined) }
+  const p = computePressure(ctxP, session, 1000000)
+  check('T3:事件窗口 ratio=0.5 且 windowSource=event', p !== null && p.ratio === 0.5 && p.window === 262144 && p.windowSource === 'event')
+  const p2 = computePressure(ctxP, { events: [] }, 1000000)
+  check('T3:无事件 → fallback 窗口且 windowSource=fallback', p2.window === 1000000 && p2.windowSource === 'fallback' && p2.ratio === 131072 / 1000000)
+  const ctxNone = { get: () => undefined }
+  check('T3:无 tokenMeter → null(不抛)', computePressure(ctxNone, session) === null)
+  const ctxThrow = { get: () => ({ measure: () => { throw new Error('boom') } }) }
+  check('T3:measure 抛错 → null(不抛)', computePressure(ctxThrow, session) === null)
+}
+
+console.log('== T4/T6 layeredCompact 编排 ==')
+{
+  const tick = () => new Promise((r) => setImmediate(r))
+  const mkLayeredCtx = ({ prunerImpl, compactImpl, measureImpl }) => {
+    const ctx = makeFakeCtx()
+    ctx.inject = (keys, cb) => {
+      const sctx = {}
+      for (const k of keys) {
+        if (k === 'compaction') sctx[k] = { compactNow: compactImpl }
+        if (k === 'tokenMeter') sctx[k] = { measure: measureImpl }
+        if (k === 'toolResultPruner') sctx[k] = prunerImpl ? { pruneSession: prunerImpl } : undefined
+      }
+      cb(sctx)
+    }
+    return ctx
+  }
+  const idle = (ctx, agent) => ctx.emit('agent/status', { agent, status: 'idle' })
+  const mkAgent = (id, events) => ({ id, session: { events } })
+  const winEvents = (window) => [{ type: 'request/context', data: { contextWindow: window } }]
+  const cfg = { ...resolveConfig({}).layeredCompact, enabled: true }
+
+  // ① L0 只观测:0.45 → observed +1,pruneSession 与 compactNow 都是 0
+  {
+    let pruneCalls = 0
+    let compactCalls = 0
+    const stats = createStats()
+    const ctx = mkLayeredCtx({
+      prunerImpl: () => { pruneCalls += 1 },
+      compactImpl: async () => { compactCalls += 1; return {} },
+      measureImpl: () => ({ totalTokens: 45000 }),
+    })
+    createLayeredCompactModule(ctx, cfg, stats)
+    await idle(ctx, mkAgent('la1', winEvents(100000)))
+    await tick()
+    const c = stats.snapshot().counters
+    check('T6①:L0 只观测(0.45 → observed 计 1)', c['layeredCompact.observed'] === 1)
+    check('T6①:L0 不触发 prune/compact', pruneCalls === 0 && compactCalls === 0)
+  }
+  // ② L1 真降分子:0.55 → prune 恰好一次;复测下降 → savedTokens>0 且 compactNow=0
+  {
+    let tokens = 55000
+    let pruneCalls = 0
+    let compactCalls = 0
+    const stats = createStats()
+    const ctx = mkLayeredCtx({
+      prunerImpl: () => { pruneCalls += 1; tokens = 30000 },
+      compactImpl: async () => { compactCalls += 1; return {} },
+      measureImpl: () => ({ totalTokens: tokens }),
+    })
+    createLayeredCompactModule(ctx, cfg, stats)
+    await idle(ctx, mkAgent('la2', winEvents(100000)))
+    await tick()
+    const c = stats.snapshot().counters
+    check('T6②:L1 prune 恰好一次且复测下降 savedTokens=25000', pruneCalls === 1 && c['layeredCompact.pruneSavedTokens'] === 25000)
+    check('T6②:lossless 计 1 且 compactNow 仍为 0(复测 0.3 < 0.65)', c['layeredCompact.lossless'] === 1 && compactCalls === 0)
+  }
+  // ③ L1 空转如实记账:0.7 + prune 无效果 → pruneNoop(不是 lossless)且仍走 L2
+  {
+    let pruneCalls = 0
+    let compactCalls = 0
+    const stats = createStats()
+    const ctx = mkLayeredCtx({
+      prunerImpl: () => { pruneCalls += 1 }, // 不改变 tokens → 复测不变
+      compactImpl: async () => { compactCalls += 1; return {} },
+      measureImpl: () => ({ totalTokens: 70000 }),
+    })
+    createLayeredCompactModule(ctx, cfg, stats)
+    await idle(ctx, mkAgent('la3', winEvents(100000)))
+    await tick()
+    const c = stats.snapshot().counters
+    check('T6③:复测无下降 → 记 pruneNoop 而非 lossless', c['layeredCompact.pruneNoop'] === 1 && c['layeredCompact.lossless'] === undefined)
+    check('T6③:pruneNoop 后仍按 ratio 走 L2(compactNow 恰 1 次)', compactCalls === 1 && c['layeredCompact.lossy'] === 1)
+  }
+  // ④ pruner 缺席不致命:pruneUnavailable + L2 照常判定
+  {
+    let compactCalls = 0
+    const stats = createStats()
+    const ctx = mkLayeredCtx({
+      prunerImpl: undefined,
+      compactImpl: async () => { compactCalls += 1; return {} },
+      measureImpl: () => ({ totalTokens: 70000 }),
+    })
+    createLayeredCompactModule(ctx, cfg, stats)
+    await idle(ctx, mkAgent('la4', winEvents(100000)))
+    await tick()
+    const c = stats.snapshot().counters
+    check('T6④:pruner 缺席 → pruneUnavailable 且 L2 照常', c['layeredCompact.pruneUnavailable'] === 1 && compactCalls === 1)
+  }
+  // ⑤ L2 恰好一次 + 两线之间反复 idle 不重复触发
+  {
+    let tokens = 80000
+    let compactCalls = 0
+    const stats = createStats()
+    const ctx = mkLayeredCtx({
+      prunerImpl: () => { if (tokens > 68000) tokens = 68000 }, // 首次降到 0.68(仍超 high)
+      compactImpl: async () => { compactCalls += 1; return {} },
+      measureImpl: () => ({ totalTokens: tokens }),
+    })
+    createLayeredCompactModule(ctx, cfg, stats)
+    const agent = mkAgent('la5', winEvents(100000))
+    await idle(ctx, agent) // 0.8 → L1 压到 0.68 → 复测仍 ≥0.65 → L2 恰 1 次
+    await tick()
+    check('T6⑤:L2 触发恰好一次', compactCalls === 1)
+    // 模拟 L2 后压力回落到两线之间(0.55):反复 idle 不再触发 L2
+    tokens = 55000
+    await idle(ctx, agent)
+    await tick()
+    await idle(ctx, agent)
+    await tick()
+    check('T6⑤:两线之间反复 idle 不重复触发', compactCalls === 1)
+  }
+  // ⑥ 错误分类:busy → failed.busy + 会话退避;prune 抛错 → pruneFailed 且不打断
+  {
+    let compactCalls = 0
+    const stats = createStats()
+    const ctx = mkLayeredCtx({
+      prunerImpl: () => { throw new Error('prune boom') },
+      compactImpl: async () => { compactCalls += 1; const e = new Error('busy'); e.code = 'busy'; throw e },
+      measureImpl: () => ({ totalTokens: 70000 }),
+    })
+    createLayeredCompactModule(ctx, cfg, stats)
+    const agent = mkAgent('la6', winEvents(100000))
+    await idle(ctx, agent) // prune 抛错 → pruneFailed;L2 compactNow busy → failed.busy + backedOff
+    await tick()
+    const c = stats.snapshot().counters
+    check('T6⑥:compactNow busy → 记 failed.busy(非笼统 failed)', c['layeredCompact.failed.busy'] === 1)
+    check('T6⑥:prune 抛错 → pruneFailed 且不打断 handler(L2 已判定)', c['layeredCompact.pruneFailed'] === 1 && compactCalls === 1)
+    await idle(ctx, agent) // backedOff:之后不再自动有损压缩
+    await tick()
+    check('T6⑥⑧:busy 后本会话退避,不再自动 compact', compactCalls === 1)
+  }
+}
+
+console.log('== T5 /token-status ==')
+{
+  const registered = []
+  const ctx = makeFakeCtx()
+  ctx.inject = (keys, cb) => {
+    const svc = {}
+    if (keys.includes('commands')) svc.commands = { register: (d) => { registered.push(d); return () => {} } }
+    if (keys.includes('tokenMeter')) svc.tokenMeter = { measure: () => ({ totalTokens: 300000 }) }
+    if (Object.keys(svc).length > 0) cb(svc)
+  }
+  const stats = createStats()
+  // 分桶键 = agent.id(与 layeredCompact 写入侧一致;会话 id 与 agent id 是两个东西)
+  stats.bucket('a1').bump('layeredCompact.lossy', 1)
+  stats.bucket('a1').bump('layeredCompact.observed', 3)
+  stats.bump('ladder.savedChars', 3200)
+  registerTokenStatusCommand(ctx, resolveConfig({}).layeredCompact, stats)
+  check('T5:命令已注册 token-status', registered.length === 1 && registered[0].name === 'token-status')
+  const agent = { id: 'a1', session: { id: 'sess-1', events: [{ type: 'request/context', data: { contextWindow: 1000000 } }] } }
+  const out = registered[0].handler({ agent })
+  check('T5:success 且含压力比/窗口来源/分层计数/金额', out.kind === 'success'
+    && /压力比 30\.0%/.test(out.text)
+    && /窗口来源:实测/.test(out.text)
+    && /有损层 1 次/.test(out.text)
+    && /元/.test(out.text))
+  const outNoSession = registered[0].handler({})
+  check('T5:无会话 → 压力比不可用但仍 success(不空话)', outNoSession.kind === 'success' && /不可用/.test(outNoSession.text))
+}
+
+console.log('== T7 outputLadder/fileDiff 基线重建回归 ==')
+{
+  // 内层 handler 改写 content → outputLadder 的压缩必须作用在内层改写后的基线上,
+  // 且 additionalContexts 不被丢弃(改前用 result.content 重建会丢)
+  const ctx2 = makeFakeCtx()
+  createOutputLadderModule(ctx2, resolveConfig({}).outputLadder, createStats())
+  ctx2.on('tools/post-execute', async (exec, result, next) => {
+    const decision = await next()
+    // 更内层:把 content 换成带 INNER 标记的另一份大 JSON,并挂 additionalContexts
+    const inner = JSON.stringify(Array.from({ length: 200 }, (_, i) => ({ idx: i, data: `INNER-${i}-${'x'.repeat(100)}` })))
+    return { ...decision, content: [{ type: 'text', text: inner }], additionalContexts: [{ type: 'text', text: 'ctx-keep' }] }
+  })
+  const exec = { name: 'pwsh', arguments: { command: 'x' } }
+  const original = JSON.stringify(Array.from({ length: 200 }, (_, i) => ({ idx: i, data: `ORIG-${i}-${'x'.repeat(100)}` })))
+  const d = await ctx2.emit('tools/post-execute', exec, { isError: false, content: [{ type: 'text', text: original }] },
+    async () => ({ kind: 'accept', content: [{ type: 'text', text: original }] }))
+  const text = txt(d.content)
+  check('T7:压缩作用在内层改写后的基线(含 INNER 不含 ORIG)', text.includes('INNER-') && !text.includes('ORIG-'))
+  check('T7:additionalContexts 不被丢弃', Array.isArray(d.additionalContexts) && d.additionalContexts[0].text === 'ctx-keep')
+  check('T7:仍完成结构压缩(json-array-compressed)', text.includes('json-array-compressed'))
+
+  // fileDiff 同款:未变折叠路径也透传 additionalContexts
+  const ctx3 = makeFakeCtx()
+  createFileDiffModule(ctx3, resolveConfig({}).fileDiff, createStats())
+  const bigFile = 'y'.repeat(4096)
+  const execR = { name: 'read', arguments: { path: 'a.txt' } }
+  await ctx3.emit('tools/post-execute', execR, { isError: false, content: [{ type: 'text', text: bigFile }] },
+    async () => ({ kind: 'accept', content: [{ type: 'text', text: bigFile }] }))
+  const d2 = await ctx3.emit('tools/post-execute', execR, { isError: false, content: [{ type: 'text', text: bigFile }] },
+    async () => ({ kind: 'accept', content: [{ type: 'text', text: bigFile }], additionalContexts: [{ type: 'text', text: 'keep-me' }] }))
+  check('T7:fileDiff 折叠路径透传 additionalContexts', /文件未变化/.test(txt(d2.content)) && d2.additionalContexts?.[0]?.text === 'keep-me')
 }
 
 console.log('')

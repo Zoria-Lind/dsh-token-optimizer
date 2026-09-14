@@ -5,6 +5,15 @@
     - id: token-optimizer
       name: 'dsh-token-optimizer'
       config:
+        # T4 分层压缩(默认关;启用时 src/index.js 会自动旁路 compactionDriver 的旧 0.45 阈值路径)
+        layeredCompact:
+          enabled: false
+          lowRatio: 0.4
+          midRatio: 0.5
+          highRatio: 0.65
+          highTierTimeoutMs: 120000
+          highTierMaxPerSession: 2
+          sessionWindowFallback: 262144
         toolTrim:
           enabled: true
           allow:

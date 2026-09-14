@@ -75,6 +75,24 @@ export const DEFAULT_CONFIG = {
     contextWindow: 1000000,        // fallback 窗口;优先读 request/context 事件
     timeoutMs: 120000,             // 单次压缩超时
   },
+  // ===== T4 分层压缩编排(0C 修正版:L0 观测 / L1 无损 prune / L2 有损 compactNow) =====
+  // 默认 enabled:false(灰度)。启用时必须同时把 compactionDriver.enabled 设为 false:
+  // 旧驱动 0.45 命中即有损,会把 L1 的无损机会整个吃掉(内核 compaction-basic 本来是
+  // "测阈 → prune → 复测 → 仍超阈才有损"的两段式)。
+  layeredCompact: {
+    enabled: false,
+    lowRatio: 0.4,                 // L0 观测层触发线(不降压力,只记账,禁止包装成"无损压缩")
+    midRatio: 0.5,                 // L1 无损层触发线(ctx.toolResultPruner.pruneSession,真降分子)
+    highRatio: 0.65,               // L2 有损层触发线(compactNow;必须用 L1 复测后的 ratio 判定)
+    highTierTimeoutMs: 120000,     // compactNow 超时(AbortSignal.timeout;超时不是 cancelled)
+    highTierMaxPerSession: 2,      // 每会话有损压缩上限
+    sessionWindowFallback: 262144, // 取不到 request/context 事件时的窗口回落值(与路由默认同值)
+    pricing: {                     // T5 金额估算用(人民币/百万 token)
+      inputPerMillion: 0.8,
+      cacheHitPerMillion: 0.23,
+      outputPerMillion: 2.8,
+    },
+  },
   // 结果缓存
   cache: {
     enabled: true,
@@ -124,6 +142,8 @@ const NUMERIC_KEYS = new Set([
   'pressureRatio', 'minTurns', 'minTokens', 'maxCompactionsPerSession', 'contextWindow', 'timeoutMs',
   'reasoningBudget', 'pageFontSize', 'pageMaxHeight',
   'askTimeoutMs', 'renderWidth', 'text2img_threshold', 'maxSummaryRatio', 'maxAsksPerSession', 'pagesPerBatch',
+  // T4 分层压缩扁平键( NUMERIC_KEYS 是全局扁平集合,子键名不得与既有键重名 )
+  'lowRatio', 'midRatio', 'highRatio', 'highTierTimeoutMs', 'highTierMaxPerSession', 'sessionWindowFallback',
 ])
 const STRING_KEYS = new Set(['visionModel', 'baseUrl', 'prompt', 'sync_dir', 'compression_strategy'])
 const STRING_ARRAY_KEYS = new Set(['tools', 'allow', 'deny', 'shellTools', 'readTools'])
@@ -154,6 +174,21 @@ const CUSTOM_VALIDATORS = {
       }
     }
   },
+  // T1:pricing 子对象走自定义校验(浅校验对子对象内层键零覆盖),校验通过后
+  // 返回深拷贝 + 冻结,避免"外层冻结内层仍是同引用可被改"的坑(08 §A13)
+  pricing(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      throw new Error('dsh-token-optimizer config: "pricing" must be an object {inputPerMillion, cacheHitPerMillion, outputPerMillion}')
+    }
+    const copy = {}
+    for (const k of ['inputPerMillion', 'cacheHitPerMillion', 'outputPerMillion']) {
+      if (!Number.isFinite(value[k]) || value[k] < 0) {
+        throw new Error(`dsh-token-optimizer config: pricing.${k} (${value[k]}) must be a non-negative number`)
+      }
+      copy[k] = value[k]
+    }
+    return Object.freeze(copy)
+  },
 }
 
 function assertNumber(name, value, { min = 0, max = Infinity } = {}) {
@@ -170,8 +205,9 @@ function resolveSection(section, defaults) {
         throw new Error(`dsh-token-optimizer config: unknown key "${key}" (allowed: ${Object.keys(defaults).join(', ')})`)
       }
       if (NUMERIC_KEYS.has(key)) {
-        if (key === 'compressionRate' || key === 'pressureRatio') assertNumber(key, value, { min: 0, max: 1 })
-        else if (key === 'maxSummaryRatio') assertNumber(key, value, { min: 0.1, max: 1 })
+        if (key === 'compressionRate' || key === 'pressureRatio' || key === 'lowRatio' || key === 'midRatio' || key === 'highRatio') {
+          assertNumber(key, value, { min: 0, max: 1 })
+        } else if (key === 'maxSummaryRatio') assertNumber(key, value, { min: 0.1, max: 1 })
         else assertNumber(key, value)
       } else if (STRING_ARRAY_KEYS.has(key)) {
         if (!Array.isArray(value) || value.some((item) => typeof item !== 'string')) {
@@ -180,7 +216,11 @@ function resolveSection(section, defaults) {
       } else if (STRING_KEYS.has(key)) {
         if (typeof value !== 'string') throw new Error(`dsh-token-optimizer config: "${key}" must be a string`)
       } else if (CUSTOM_VALIDATORS[key]) {
-        CUSTOM_VALIDATORS[key](value)
+        // 校验器可返回深拷贝/规范化后的替换值;返回 undefined 则沿用原值。
+        // 已在此赋值 → continue 跳过循环尾的统一 out[key] = value(否则会被覆盖回去)
+        const replacement = CUSTOM_VALIDATORS[key](value)
+        out[key] = replacement !== undefined ? replacement : value
+        continue
       } else if (typeof value !== typeof defaults[key]) {
         throw new Error(`dsh-token-optimizer config: "${key}" must be ${typeof defaults[key]}`)
       }
@@ -208,6 +248,7 @@ export function resolveConfig(config = {}) {
     toolTrim: resolveSection(config.toolTrim, DEFAULT_CONFIG.toolTrim),
     outputLadder: resolveSection(config.outputLadder, DEFAULT_CONFIG.outputLadder),
     compactionDriver: resolveSection(config.compactionDriver, DEFAULT_CONFIG.compactionDriver),
+    layeredCompact: resolveSection(config.layeredCompact, DEFAULT_CONFIG.layeredCompact),
     // 占位节:enabled=false 时无模块消费,仅保证配置合法(阶段 3b 后开开关)
     memory_bridge: resolveSection(config.memory_bridge, DEFAULT_CONFIG.memory_bridge),
   })

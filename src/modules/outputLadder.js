@@ -171,7 +171,12 @@ export function createOutputLadderModule(ctx, config, stats) {
     // 1) read 类工具豁免:首次读完整保留,重复读由 fileDiff 管
     if (readTools.has(exec?.name)) return decision
 
-    const blocks = result?.content
+    // T7(层序敏感写法):以 decision.content ?? result.content 为基线——
+    // 本插件在 profile bundles 里偏内层,更外层 handler(better-edit/spill-policy 等)
+    // 可能已经改写过 content;基线取 decision 才不会覆盖掉内层改写。
+    // 返回必须 spread decision:保留 additionalContexts 等下游字段(accept 路径下
+    // 内核会拼接 result 与 decision 的 contexts,result 在前)。
+    const blocks = decision.content ?? result?.content
     const text = toText(blocks)
     // 2) 无文本块
     if (text.length === 0) return decision
@@ -222,8 +227,9 @@ export function createOutputLadderModule(ctx, config, stats) {
     stats?.bump('ladder.savedChars', savedChars)
     stats?.addSample({ module: 'outputLadder', tool: exec?.name, branch, savedChars })
 
+    // T7:spread decision 透传 additionalContexts 等;content 以基线重建
     return {
-      kind: 'accept',
+      ...decision,
       content: foldTextBlocks(blocks, final),
     }
   }
