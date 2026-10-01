@@ -3,7 +3,7 @@
 # loader resolves the row by package name after the dsh-base layer inserts.
 - insert:
     - id: token-optimizer
-      name: 'dsh-token-optimizer'
+      name: '@zoria-lind/dsh-token-optimizer'
       config:
         # T4 分层压缩(默认关;启用时 src/index.js 会自动旁路 compactionDriver 的旧 0.45 阈值路径)
         layeredCompact:

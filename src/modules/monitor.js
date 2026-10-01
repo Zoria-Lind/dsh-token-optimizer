@@ -90,7 +90,7 @@ export function createMonitorModule(ctx, config, stats) {
       try {
         session.append('user', {
           content: [{ type: 'text', text: report }],
-          source: { kind: 'plugin', plugin: 'dsh-token-optimizer' },
+          source: { kind: 'plugin:dsh-token-optimizer' },
         })
       } catch {
         // 追加失败不致命
