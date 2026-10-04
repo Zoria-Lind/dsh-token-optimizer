@@ -20,8 +20,16 @@
 // 窗口口径(T3/07 §A):tokenMeter.measure() 不返回 contextWindow——窗口只能扫
 // 会话日志里最新的 request/context 事件;取不到则用 fallback 并标记来源
 // (fallback 不是实测值:1e6 与路由默认 262144 差 4 倍,把回落值当实测会整体错位)。
+// 2026-10-04 适配 0.2.0:session.events 已移除,新接口 snapshotEvents();0.1.x 兼容保留
+function sessionEvents(session) {
+  if (typeof session?.snapshotEvents === 'function') {
+    try { return session.snapshotEvents() } catch { return null }
+  }
+  return session?.events ?? null
+}
+
 function latestContextEvent(session) {
-  const events = session?.events
+  const events = sessionEvents(session)
   if (!Array.isArray(events)) return null
   for (let i = events.length - 1; i >= 0; i--) {
     const e = events[i]
@@ -116,7 +124,7 @@ export function createCompactionDriverModule(ctx, config, stats) {
   let warnedNoEvents = false
 
   function turnCountOf(session) {
-    const events = session?.events
+    const events = sessionEvents(session)
     if (!Array.isArray(events)) {
       if (!warnedNoEvents) {
         warnedNoEvents = true
