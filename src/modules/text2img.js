@@ -21,7 +21,7 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 // 调试日志:默认关闭,需要排查时设 DSH_TOKEN_OPTIMIZER_DEBUG=1 才写盘
-const DEBUG_LOG = 'D:\\dsh\\text2img-debug.log'
+const DEBUG_LOG = process.env.DSH_TOKEN_OPTIMIZER_DEBUG_LOG || join(homedir(), '.dsh', 'text2img-debug.log')
 const DEBUG_ENABLED = !!process.env.DSH_TOKEN_OPTIMIZER_DEBUG
 function dbg(msg) {
   if (!DEBUG_ENABLED) return

@@ -15,6 +15,7 @@ import { createOutputLadderModule } from '../src/modules/outputLadder.js'
 import { createCompactionDriverModule, computePressure } from '../src/modules/compactionDriver.js'
 import { createLayeredCompactModule } from '../src/modules/layeredCompact.js'
 import { registerTokenStatusCommand } from '../src/commands/tokenStatus.js'
+import { runCompressionChecks } from './compression.mjs'
 
 let failures = 0
 function check(name, cond) {
@@ -631,7 +632,7 @@ console.log('== compactionDriver ==')
     const agent = mkAgent(10, 500000)
     await ctx.emit('agent/status', { agent, status: 'idle' })
     await tick()
-    check('compactionDriver null 结果计次不崩', calls === 1 && stats.snapshot().counters['compactionDriver.completed'] === undefined)
+    check('compactionDriver null 不计成功、不崩', calls === 1 && stats.snapshot().counters['compactionDriver.completed'] === undefined)
   }
   // 无服务:不触发、不抛(惰性获取,每次 idle 重试,只告警一次)
   {
@@ -661,7 +662,7 @@ console.log('== cache ==')
   const ctx = makeFakeCtx()
   const stats = createStats()
   let executions = 0
-  createCacheModule(ctx, resolveConfig({}).cache, stats)
+  createCacheModule(ctx, { ...resolveConfig({}).cache, enabled: true }, stats)
   const exec = { name: 'glob', arguments: { pattern: '**/*.js' } }
   const run = async () => ctx.emit('tools/execute', exec, async () => {
     executions += 1
@@ -669,8 +670,8 @@ console.log('== cache ==')
   })
   await run()
   await run()
-  check('第二次命中缓存未执行', executions === 1)
-  check('cache.hits=1', stats.snapshot().counters['cache.hits'] === 1)
+  check('暂停缓存：重复调用仍执行工具', executions === 2)
+  check('暂停缓存：不虚报命中', !stats.snapshot().counters['cache.hits'])
 }
 
 console.log('== monitor ==')
@@ -715,22 +716,22 @@ console.log('== fileDiff ==')
 {
   const ctx = makeFakeCtx()
   const stats = createStats()
-  createFileDiffModule(ctx, resolveConfig({}).fileDiff, stats)
+  createFileDiffModule(ctx, { ...resolveConfig({}).fileDiff, enabled: true }, stats)
   const textA = 'line0\nline1\n' + 'padding-line-x\n'.repeat(500)
   const mk = (text) => ({ isError: false, content: [{ type: 'text', text }] })
   const d1 = await ctx.emit('tools/post-execute', { name: 'read', arguments: { path: 'a.txt' } }, mk(textA), async () => ({ kind: 'accept' }))
   check('fileDiff 首次读不改投影', d1.kind === 'accept' && d1.content === undefined)
   const d2 = await ctx.emit('tools/post-execute', { name: 'read', arguments: { path: 'a.txt' } }, mk(textA), async () => ({ kind: 'accept' }))
-  check('fileDiff 未变化折叠', /未变化/.test(txt(d2.content)))
+  check('fileDiff 无可信基线仍返回原文', d2.content === undefined)
   const textB = textA.replace('line1', 'line1-CHANGED')
   const d3 = await ctx.emit('tools/post-execute', { name: 'read', arguments: { path: 'a.txt' } }, mk(textB), async () => ({ kind: 'accept' }))
-  check('fileDiff 变更发 diff', /变更/.test(txt(d3.content)) && /CHANGED/.test(txt(d3.content)))
-  check('fileDiff 统计', stats.snapshot().counters['filediff.unchanged'] >= 1 && stats.snapshot().counters['filediff.changed'] >= 1)
+  check('fileDiff 变更仍返回原文', d3.content === undefined)
+  check('fileDiff 不虚报节省', !stats.snapshot().counters['filediff.unchanged'] && !stats.snapshot().counters['filediff.changed'])
 
   // 真实 read 工具的参数键是 file_path(pathOf 兼容)
   const d4 = await ctx.emit('tools/post-execute', { name: 'read', arguments: { file_path: 'c.txt' } }, mk(textA), async () => ({ kind: 'accept' }))
   const d5 = await ctx.emit('tools/post-execute', { name: 'read', arguments: { file_path: 'c.txt' } }, mk(textA), async () => ({ kind: 'accept' }))
-  check('fileDiff file_path 键未变化折叠', /未变化/.test(txt(d5.content)))
+  check('fileDiff file_path 键也保留原文', d5.content === undefined)
 
   // 分段读取(offset/limit)不参与追踪/折叠:同一文件两个不同窗口不得被误判为"变更"
   const part1 = 'p'.repeat(3000)
@@ -778,124 +779,8 @@ console.log('== toolTrim ==')
   check('toolTrim 空载荷不抛', true)
 }
 
-console.log('== toolGate mcpLazy ==')
-{
-  const identityDefineTool = (o) => o
-  const tick = () => new Promise((r) => setTimeout(r, 10))
-
-  // 1) 检测到 mcp 工具 → 注册元工具 + deny 全量拦截
-  {
-    const ctx = makeFakeCtx()
-    const stats = createStats()
-    const restricted = []
-    const registered = []
-    const disposers = []
-    const mkDisposer = (i) => { let called = 0; disposers.push({ called: () => called, call: () => { called += 1 } }); return disposers[disposers.length - 1] }
-    const tools = {
-      view: () => ({
-        restrictableNames: new Set(['read', 'write', 'mcp__srv__a', 'mcp__srv__b']),
-        visible: new Map([
-          ['mcp__srv__a', { description: 'analyze tool A' }],
-          ['mcp__srv__b', { description: 'analyze tool B' }],
-        ]),
-      }),
-      restrict: (filter) => { restricted.push(filter); const d = mkDisposer(); return () => d.call() },
-      register: (def) => { registered.push(def); return () => {} },
-    }
-    createToolTrimModule(ctx, { ...resolveConfig({}).toolTrim, enabled: true, allow: [], deny: [], mcpLazy: true }, stats, { defineTool: identityDefineTool })
-    await ctx.emit('agent/created', { agent: { id: 'm1', ctx: { tools } } })
-    await tick()
-    check('toolGate 检测 mcp 注册元工具', registered.length === 1 && registered[0].name === 'mcp_load_tools')
-    check('toolGate 索引含工具描述', /mcp__srv__a: analyze tool A/.test(registered[0].description))
-    check('toolGate 初始 deny 全量 mcp', restricted.length === 1 && restricted[0].deny.includes('mcp__srv__a') && restricted[0].deny.includes('mcp__srv__b'))
-    check('toolGate mcpDetected 计数', stats.snapshot().counters['toolgate.mcpDetected'] === 1)
-
-    // 2) 放行一个 → 旧 disposer 被调 + 重挂 filter 只剩 b
-    const meta = registered[0]
-    const out = await meta.execute({ names: ['mcp__srv__a'] }, { agent: { id: 'm1' } })
-    await tick()
-    check('toolGate 放行后旧 restrict 被撤', disposers[0].called() === 1)
-    check('toolGate 重挂 deny 只剩 b', restricted.length === 2 && !restricted[1].deny.includes('mcp__srv__a') && restricted[1].deny.includes('mcp__srv__b'))
-    check('toolGate 放行返回文案', /已放行: mcp__srv__a/.test(out))
-    check('toolGate mcpReleased 计数', stats.snapshot().counters['toolgate.mcpReleased'] === 1)
-
-    // 3) 未知名 → 不触发重挂
-    const before = restricted.length
-    const out2 = await meta.execute({ names: ['mcp__nope'] }, { agent: { id: 'm1' } })
-    check('toolGate 未知名不重挂', restricted.length === before && /未知或不可放行: mcp__nope/.test(out2))
-  }
-
-  // 4) 无 mcp 工具 → no-op(不注册元工具),静态 allow 仍生效
-  {
-    const ctx = makeFakeCtx()
-    const restricted = []
-    const registered = []
-    const tools = {
-      view: () => ({ restrictableNames: new Set(['read', 'write']), visible: new Map() }),
-      restrict: (filter) => { restricted.push(filter); return () => {} },
-      register: () => { registered.push(1); return () => {} },
-    }
-    createToolTrimModule(ctx, { ...resolveConfig({}).toolTrim, enabled: true, allow: ['read'], deny: [], mcpLazy: true }, createStats(), { defineTool: identityDefineTool })
-    await ctx.emit('agent/created', { agent: { id: 'm2', ctx: { tools } } })
-    await tick()
-    check('toolGate 无 mcp 不注册元工具', registered.length === 0)
-    check('toolGate 静态 allow 仍挂载', restricted.length === 1 && restricted[0].allow.includes('read'))
-  }
-
-  // 5) restrict 抛错 → warn 不崩,元工具仍在
-  {
-    const ctx = makeFakeCtx()
-    const registered = []
-    const tools = {
-      view: () => ({ restrictableNames: new Set(['mcp__srv__a']), visible: new Map([['mcp__srv__a', { description: 'd' }]]) }),
-      restrict: () => { throw new Error('names unknown global tool') },
-      register: (def) => { registered.push(def); return () => {} },
-    }
-    createToolTrimModule(ctx, { ...resolveConfig({}).toolTrim, enabled: true, allow: [], deny: [], mcpLazy: true }, createStats(), { defineTool: identityDefineTool })
-    await ctx.emit('agent/created', { agent: { id: 'm3', ctx: { tools } } })
-    await tick()
-    check('toolGate restrict 抛错元工具仍注册', registered.length === 1)
-  }
-
-  // 6) 静态 allow + mcp 放行合并
-  {
-    const ctx = makeFakeCtx()
-    const restricted = []
-    const registered = []
-    const tools = {
-      view: () => ({ restrictableNames: new Set(['read', 'mcp__srv__a']), visible: new Map([['mcp__srv__a', { description: 'd' }]]) }),
-      restrict: (filter) => { restricted.push(filter); return () => {} },
-      register: (def) => { registered.push(def); return () => {} },
-    }
-    createToolTrimModule(ctx, { ...resolveConfig({}).toolTrim, enabled: true, allow: ['read'], deny: [], mcpLazy: true }, createStats(), { defineTool: identityDefineTool })
-    await ctx.emit('agent/created', { agent: { id: 'm4', ctx: { tools } } })
-    await tick()
-    await registered[0].execute({ names: ['mcp__srv__a'] }, { agent: { id: 'm4' } })
-    await tick()
-    check('toolGate 静态 allow 与放行合并', restricted.length === 2 && restricted[1].allow.includes('read') && restricted[1].allow.includes('mcp__srv__a'))
-  }
-
-  // 7) 死循环回归:restrict 触发 tools/change → 无真实变化时不得重挂
-  // (事故:tools/change → 重挂 → restrict → tools/change 循环到 harness OOM)
-  {
-    const ctx = makeFakeCtx()
-    const restricted = []
-    const tools = {
-      view: () => ({ restrictableNames: new Set(['mcp__srv__a']), visible: new Map([['mcp__srv__a', { description: 'd' }]]) }),
-      restrict: (filter) => { restricted.push(filter); return () => {} },
-      register: () => () => {},
-    }
-    createToolTrimModule(ctx, { ...resolveConfig({}).toolTrim, enabled: true, allow: [], deny: [], mcpLazy: true }, createStats(), { defineTool: identityDefineTool })
-    await ctx.emit('agent/created', { agent: { id: 'm5', ctx: { tools } } })
-    await tick()
-    const afterCreated = restricted.length
-    for (let i = 0; i < 20; i++) await ctx.emit('tools/change')
-    await tick()
-    check('toolGate tools/change 无变化不重挂(防死循环)', restricted.length === afterCreated)
-  }
-}
-
-console.log('')
+const { runAvailabilityChecks } = await import('./availability.mjs')
+await runAvailabilityChecks(check)
 
 // ===== v2.2 迭代(T1/T2/T3/T4/T5/T7)测试 =====
 
@@ -1099,15 +984,15 @@ console.log('== T5 /token-status ==')
   stats.bucket('a1').bump('layeredCompact.lossy', 1)
   stats.bucket('a1').bump('layeredCompact.observed', 3)
   stats.bump('ladder.savedChars', 3200)
-  registerTokenStatusCommand(ctx, resolveConfig({}).layeredCompact, stats)
+  registerTokenStatusCommand(ctx, resolveConfig({}), stats)
   check('T5:命令已注册 token-status', registered.length === 1 && registered[0].name === 'token-status')
   const agent = { id: 'a1', session: { id: 'sess-1', events: [{ type: 'request/context', data: { contextWindow: 1000000 } }] } }
   const out = registered[0].handler({ agent })
-  check('T5:success 且含压力比/窗口来源/分层计数/金额', out.kind === 'success'
+  check('T5:success 且含压力比/窗口来源/分层计数/费用口径', out.kind === 'success'
     && /压力比 30\.0%/.test(out.text)
-    && /窗口来源:实测/.test(out.text)
-    && /有损层 1 次/.test(out.text)
-    && /元/.test(out.text))
+    && /窗口来源:request\/context 声明/.test(out.text)
+    && /分层模型摘要：尝试 0 \/ 成功 1/.test(out.text)
+    && /API 费用/.test(out.text))
   const outNoSession = registered[0].handler({})
   check('T5:无会话 → 压力比不可用但仍 success(不空话)', outNoSession.kind === 'success' && /不可用/.test(outNoSession.text))
 }
@@ -1133,7 +1018,7 @@ console.log('== T7 outputLadder/fileDiff 基线重建回归 ==')
   check('T7:additionalContexts 不被丢弃', Array.isArray(d.additionalContexts) && d.additionalContexts[0].text === 'ctx-keep')
   check('T7:仍完成结构压缩(json-array-compressed)', text.includes('json-array-compressed'))
 
-  // fileDiff 同款:未变折叠路径也透传 additionalContexts
+  // fileDiff 安全降级：原样保留内层投影与 additionalContexts
   const ctx3 = makeFakeCtx()
   createFileDiffModule(ctx3, resolveConfig({}).fileDiff, createStats())
   const bigFile = 'y'.repeat(4096)
@@ -1142,8 +1027,10 @@ console.log('== T7 outputLadder/fileDiff 基线重建回归 ==')
     async () => ({ kind: 'accept', content: [{ type: 'text', text: bigFile }] }))
   const d2 = await ctx3.emit('tools/post-execute', execR, { isError: false, content: [{ type: 'text', text: bigFile }] },
     async () => ({ kind: 'accept', content: [{ type: 'text', text: bigFile }], additionalContexts: [{ type: 'text', text: 'keep-me' }] }))
-  check('T7:fileDiff 折叠路径透传 additionalContexts', /文件未变化/.test(txt(d2.content)) && d2.additionalContexts?.[0]?.text === 'keep-me')
+  check('T7:fileDiff 保留原文并透传 additionalContexts', txt(d2.content) === bigFile && d2.additionalContexts?.[0]?.text === 'keep-me')
 }
+
+await runCompressionChecks(check)
 
 console.log('')
 if (failures === 0) {

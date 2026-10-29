@@ -1,7 +1,7 @@
 {
   "name": "@zoria-lind/dsh-token-optimizer",
-  "version": "2.2.2",
-  "description": "分层 Token 优化管道 v2:输出阶梯 / 结果缓存 / 文件 diff / 工具裁剪 + MCP 懒加载 / 压缩调度 / 缓存命中率,基于 DSH 真实插件 API",
+  "version": "3.0.0",
+  "description": "分层 Token 优化管道:输出阶梯 / 工具裁剪与 MCP 懒加载 / 压缩设置与状态 / runtime 原文归档,基于 DSH 真实插件 API",
   "license": "MIT",
   "type": "module",
   "engines": {
@@ -13,7 +13,8 @@
   },
   "main": "src/index.js",
   "exports": {
-    ".": "./src/index.js"
+    ".": "./src/index.js",
+    "./client": "./src/client.js"
   },
   "files": [
     "src",
@@ -30,15 +31,20 @@
       "patch": "./cordis.patch.yml"
     },
     "compatibility": {
-      "dsh": ">=0.1.5-rc.1 <0.1.6-0 || >=0.1.6-rc.0 <0.1.7-0 || >=0.1.7-rc.0 <0.2.0-0",
+      "dsh": ">=0.1.5-rc.1 <0.1.6-0 || >=0.1.6-rc.0 <0.1.7-0 || >=0.1.7-rc.0 <0.2.0-0 || >=0.2.0-rc.0 <0.2.2-0",
       "dshReleases": {
         "0.1.5-rc.1": "compatible",
         "0.1.5-rc.2": "compatible",
         "0.1.7-rc.1": "compatible",
-        "0.2.0-rc.2": "compatible"
+        "0.2.0-rc.2": "compatible",
+        "0.2.1-rc.2": "compatible"
       }
     },
-    "pluginType": "feature"
+    "pluginType": "feature",
+    "client": {
+      "inject": [],
+      "platform": "web"
+    }
   },
   "keywords": [
     "dsh",
@@ -47,5 +53,8 @@
     "compression",
     "dsh-plugin",
     "deepseek-harness"
-  ]
+  ],
+  "peerDependencies": {
+    "@deepseek-ai/schemastery": "^3.18.3"
+  }
 }

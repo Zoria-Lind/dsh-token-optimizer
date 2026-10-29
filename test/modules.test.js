@@ -84,11 +84,11 @@ test('outputLadder: CSV 头尾保留', async () => {
   assert.match(decision.content[0].text, /id,name/) // 表头保留
 })
 
-test('cache: 命中短路,未命中执行', async () => {
+test('cache: 暂停不安全复用，重复调用执行工具', async () => {
   const ctx = makeFakeCtx()
   const stats = createStats()
   let executions = 0
-  createCacheModule(ctx, resolveConfig({}).cache, stats)
+  createCacheModule(ctx, { ...resolveConfig({}).cache, enabled: true }, stats)
 
   const exec = { name: 'glob', arguments: { pattern: '**/*.js' } }
   const run = async () => {
@@ -100,6 +100,6 @@ test('cache: 命中短路,未命中执行', async () => {
   }
   await run()
   await run()
-  assert.equal(executions, 1) // 第二次命中缓存,未执行
-  assert.equal(stats.snapshot().counters['cache.hits'], 1)
+  assert.equal(executions, 2) // 只读搜索依赖外部文件状态，每次重新执行
+  assert.equal(stats.snapshot().counters['cache.hits'] ?? 0, 0)
 })

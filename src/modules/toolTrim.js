@@ -1,30 +1,4 @@
-// 工具可见性管理(toolTrim / toolGate):按会话裁剪工具 schema + MCP 懒加载。
-//
-// v1(保留):监听 agent/created,对每个 agent 作用域调 tools.restrict({allow,deny})
-// 裁剪"继承到的工具",未用工具的描述不再进请求,省固定 token。
-//
-// v2 新增 mcpLazy:MCP 工具全量 schema 每请求注入(dsh-mcp-client 启动即注册到
-// 全局层),对低频使用的 MCP 服务器是纯浪费。本模块检测 mcp__* 前缀工具:
-//   - 默认全部 deny(模型看不到 = schema 不进请求)
-//   - 注册 mcp_load_tools 元工具(agent 作用域自注册,restrict 豁免、永远可见),
-//     description 携带轻量索引(服务器名+工具名+一句话)
-//   - 模型调用元工具按名放行 → 该工具从下次请求起可见,会话内保持
-// 无 mcp__* 工具时全程 no-op(未配 MCP 的部署装上也不影响任何东西)。
-//
-// 关键机制(核心源码核实):
-//   - restrict 多次调用是 AND 交集(dsh-tools admits 要求全 filter 放行),
-//     动态放行必须 dispose 全部旧 restrict 再重挂新 filter;
-//     重挂采用"先挂新、后撤旧",交集窗口期 = 旧 filter 本身,不会提前放行,
-//     挂新失败则旧 filter 完好(fail-closed)
-//   - mcp 客户端重连会 dispose 旧代工具/注册新代(名字可能变),每次挂载前
-//     都用 tools.view(agent).restrictableNames 过滤失效名字,tools/change
-//     事件触发重新发现与重挂
-//   - defineTool 经 createRequire 从 @deepseek-ai/dsh-tools 解析(与
-//     dsh-undo-savepoint 同款模式,DSH_ROOT 兜底),解析失败则 mcpLazy 降级禁用、
-//     静态裁剪不受影响
-//
-// cordis 规则:所有服务访问 try/catch,失败只 console.warn,绝不破坏会话。
-
+// Scoped tool availability and bounded MCP discovery; verified against DSH 0.2.1-rc.2.
 import { createRequire } from 'node:module'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
@@ -39,7 +13,7 @@ const TEXT_OUTPUT = {
 // DSH_HOME/.dsh 的 profiles/node_modules(CLI 安装器生成的符号链接桥,
 // 指回全局 CLI 树,dsh-undo-savepoint 同款依赖)→ 全局 npm 目录。
 // 全部失败返回 undefined,mcpLazy 降级禁用,静态裁剪不受影响。
-function resolveDefineTool() {
+export function resolveDefineTool() {
   const anchors = []
   anchors.push(import.meta.url) // 插件自身位置
   if (process.env.DSH_ROOT) anchors.push(join(process.env.DSH_ROOT, 'package.json'))
@@ -59,242 +33,234 @@ function resolveDefineTool() {
 
 function getView(tools, agent) {
   try {
-    if (tools && typeof tools.view === 'function') {
-      const v = tools.view(agent)
-      if (v && v.restrictableNames instanceof Set) return v
-    }
-  } catch { /* view 半公开 API,失败走降级 */ }
-  return null
+    const view = tools?.view?.(agent)
+    return view?.restrictableNames instanceof Set && view.visible instanceof Map ? view : null
+  } catch { return null }
 }
 
-function discoverMcp(view, prefix) {
-  return [...view.restrictableNames].filter((n) => n.startsWith(prefix)).sort()
-}
-
-function buildIndex(view, allMcp) {
-  const parts = []
-  let total = 0
-  for (const name of allMcp) {
-    const desc = view?.visible?.get?.(name)?.description ?? ''
-    const line = `${name}: ${String(desc).split('\n')[0].slice(0, 120)}`
-    parts.push(line)
-    total += line.length
-    if (total > 2000) {
-      parts.push('...(索引截断)')
-      break
-    }
-  }
-  return parts.join('; ')
-}
+const PAGE_SIZE = 10
+const MAX_PAGE = 20
+const MAX_LOAD = 20
+const label = name => name.length > 200 ? name.slice(0, 200) + '…' : name
+const warn = message => console.warn('[dsh-token-optimizer] toolTrim: ' + message)
 
 export function createToolTrimModule(ctx, config, stats, deps = {}) {
-  if (!config?.enabled) return () => {}
-
-  const allow = Array.isArray(config.allow) ? config.allow.filter((n) => typeof n === 'string') : []
-  const deny = Array.isArray(config.deny) ? config.deny.filter((n) => typeof n === 'string') : []
-  const mcpLazy = config.mcpLazy
-  const defineTool = deps.defineTool ?? resolveDefineTool()
-
-  if (allow.length === 0 && deny.length === 0 && (!mcpLazy || typeof defineTool !== 'function')) {
-    // 空 filter 且无 MCP 能力:no-op(保留 v1 告警)
-    console.warn('[dsh-token-optimizer] toolTrim 已启用但 allow/deny 均为空且未启用 mcpLazy,裁剪未生效')
-    return () => {}
+  if (!config?.enabled || typeof ctx?.on !== 'function') return () => {}
+  // null/omitted means unrestricted; [] intentionally allows no inherited tools.
+  const allow = Array.isArray(config.allow) ? new Set(config.allow) : null
+  const deny = new Set(config.deny ?? [])
+  const defineTool = config.mcpLazy ? (deps.defineTool ?? resolveDefineTool()) : undefined
+  const gates = new Map()
+  const ownedDefinitions = new WeakSet()
+  let closed = false
+  let warnedCompatibility = false
+  const allowed = name => (allow === null || allow.has(name)) && !deny.has(name)
+  const live = gate => !closed && !gate.dead && gates.get(gate.agent.id) === gate
+  function dispose(effect) {
+    try { effect?.(); return true } catch (err) { warn('撤销失败: ' + (err?.message ?? err)); return false }
   }
-
-  if (!ctx || typeof ctx.on !== 'function') {
-    console.warn('[dsh-token-optimizer] toolTrim 已启用但 ctx.on 不可用,裁剪未生效')
-    return () => {}
-  }
-
-  let warnedNoDefineTool = false
-  const gates = new Map() // agentId -> { agent, tools, disposer, metaDisposer, allMcp, released, metaRegistered, lastFilterKey }
-
-  function disposeGate(gate) {
-    try { if (typeof gate?.metaDisposer === 'function') gate.metaDisposer() } catch { /* 忽略 */ }
-    try { if (typeof gate?.disposer === 'function') gate.disposer() } catch { /* 忽略 */ }
+  function dropMeta(gate) {
+    const effect = gate.metaDisposer
     gate.metaDisposer = undefined
+    gate.definition = undefined
+    dispose(effect)
+  }
+  function destroy(gate) {
+    gate.dead = true
+    gates.delete(gate.agent.id) // invalidate callbacks before effects emit tools/change
+    dropMeta(gate)
+    dispose(gate.disposer)
     gate.disposer = undefined
+    gate.catalog.clear()
+    gate.released.clear()
   }
 
-  // 合成 filter(静态 allow/deny 与 mcp 放行合并进同一条 restrict,避免 AND 交集问题)
-  // 先挂新、后撤旧;挂新失败则旧 gate 原样(fail-closed)
-  async function mountGate(gate, view) {
-    const restrictable = view?.restrictableNames ?? null
-    const valid = (name) => !restrictable || restrictable.has(name)
-    let nextAllow = allow.filter(valid)
-    let nextDeny = deny.filter(valid)
-    if (gate.allMcp.length > 0) {
-      if (nextAllow.length > 0) {
-        nextAllow = [...nextAllow, ...gate.released].filter(valid)
-      } else {
-        nextDeny = [...nextDeny, ...gate.allMcp.filter((n) => !gate.released.has(n))].filter(valid)
-      }
-    }
+  function mount(gate, view, released, lazyReady) {
+    const valid = name => name !== 'run_code' && (!view || view.restrictableNames.has(name))
     const filter = {}
-    if (nextAllow.length > 0) filter.allow = nextAllow
-    if (nextDeny.length > 0) filter.deny = nextDeny
-
-    // 幂等:filter 未变化不重挂。restrict 会经作用域 admission 变化触发
-    // tools/change → 本模块 onToolsChange 再重挂 → 再触发 change 的死循环
-    // (真实事故:harness 被循环到 OOM)。filterKey 只在 restrict 成功后才记录,
-    // 失败时不记录,允许下次用同 filter 重试。
-    const filterKey = JSON.stringify(filter)
-    if (gate.lastFilterKey === filterKey) return
-
-    let newDisposer
-    if (filter.allow || filter.deny) {
-      try {
-        const d = gate.tools.restrict(filter)
-        if (typeof d === 'function') newDisposer = d
-        stats?.bump('tooltrim.applied', 1)
-        stats?.addSample({ module: 'tooltrim', allow: nextAllow.length, deny: nextDeny.length, mcpReleased: gate.released.size })
-      } catch (err) {
-        console.warn(`[dsh-token-optimizer] toolTrim 未生效:${err?.message ?? err}`)
-        return
-      }
-    }
-    const old = gate.disposer
-    gate.disposer = newDisposer ?? (() => {})
-    gate.lastFilterKey = filterKey
-    if (old) {
-      try { old() } catch { /* 忽略 */ }
-    }
-    if (filter.allow || filter.deny) {
-      console.log(`[dsh-token-optimizer] toolTrim 生效:agent "${gate.agent?.id ?? '?'}" 已按 allow ${nextAllow.length} / deny ${nextDeny.length} 裁剪工具(mcp 放行 ${gate.released.size})`)
-    }
-  }
-
-  async function registerMetaTool(gate, view) {
-    if (!mcpLazy || typeof defineTool !== 'function' || gate.allMcp.length === 0) return
-    if (!gate.tools || typeof gate.tools.register !== 'function') return
-    // 幂等:索引没变化且已注册过就跳过(agent/created 与 tools/change 双路触发)
-    const indexText = buildIndex(view, gate.allMcp)
-    if (gate.metaRegistered && gate.metaIndex === indexText) return
-    // 旧 meta 先撤(索引随重连变化时刷新)
-    try { if (typeof gate.metaDisposer === 'function') gate.metaDisposer() } catch { /* 忽略 */ }
-    gate.metaDisposer = undefined
-    const definition = defineTool({
-      name: config.mcpLoadToolName,
-      description: '按需放行 MCP 工具(懒加载)。默认全部 MCP 工具不可见,调用本工具指定名字后,这些工具才会出现在后续请求中并保持到会话结束。当前可用索引: ' + indexText,
-      parameters: {
-        names: { type: 'array', items: { type: 'string' }, description: '要放行的 mcp 工具名数组(如 mcp__server__tool)' },
-      },
-      output: TEXT_OUTPUT,
-      isConcurrencySafe: () => false,
-      async execute(args, exec) {
-        const agent = exec?.agent
-        const gateFor = agent?.id !== undefined ? gates.get(agent.id) : undefined
-        const names = Array.isArray(args?.names) ? args.names.filter((n) => typeof n === 'string') : []
-        if (!gateFor) return '未找到本会话的 MCP 门控状态(可能未发现 MCP 工具),放行未生效'
-        const released = []
-        const unknown = []
-        for (const n of names) {
-          if (gateFor.allMcp.includes(n)) {
-            gateFor.released.add(n)
-            released.push(n)
-          } else {
-            unknown.push(n)
-          }
-        }
-        if (released.length > 0) {
-          const freshView = getView(gateFor.tools, agent)
-          await mountGate(gateFor, freshView)
-          stats?.bump('toolgate.mcpReleased', released.length)
-          stats?.bump('toolgate.remounts', 1)
-        }
-        const stillDenied = gateFor.allMcp.filter((n) => !gateFor.released.has(n))
-        return `已放行: ${released.join(', ') || '(无)'};未知或不可放行: ${unknown.join(', ') || '(无)'};仍被拦截: ${stillDenied.join(', ') || '(无)'}`
-      },
-    })
+    if (allow !== null) filter.allow = [...allow].filter(valid).sort()
+    const hidden = lazyReady ? [...gate.catalog.keys()].filter(name => !released.has(name)) : []
+    const blocked = [...new Set([...deny, ...hidden])].filter(valid).sort()
+    if (blocked.length) filter.deny = blocked
+    const key = JSON.stringify(filter)
+    if (gate.filterKey === key) return true
+    let effect
     try {
-      const d = gate.tools.register(definition)
-      if (typeof d === 'function') gate.metaDisposer = d
-      gate.metaRegistered = true
-      gate.metaIndex = indexText
+      if (filter.allow !== undefined || filter.deny !== undefined) {
+        effect = gate.tools.restrict(filter)
+        if (typeof effect !== 'function') throw Error('restrict 未返回可撤销句柄，无法保证过滤替换')
+      }
+    } catch (err) { warn('过滤未生效: ' + (err?.message ?? err)); return false }
+    if (!live(gate)) { dispose(effect); return false }
+    const old = gate.disposer
+    gate.disposer = effect
+    gate.filterKey = key // own mutation events must not remount this filter
+    if (!dispose(old)) {
+      gate.disposer = () => { effect?.(); old?.() }
+      gate.filterKey = undefined
+      return false
+    }
+    if (effect) {
+      stats?.bump('tooltrim.applied', 1)
+      stats?.addSample({ module: 'tooltrim', allow: filter.allow?.length, deny: blocked.length, mcpReleased: released.size })
+    }
+    return true
+  }
+
+  function registerMeta(gate, view) {
+    if (deny.has(config.mcpLoadToolName)) { dropMeta(gate); return false }
+    if (gate.metaDisposer && view.visible.get(config.mcpLoadToolName) === gate.definition) return true
+    dropMeta(gate)
+    const existing = view.visible.get(config.mcpLoadToolName)
+    if (view.knownNames?.has(config.mcpLoadToolName) && !ownedDefinitions.has(existing)) {
+      warn('发现同名 ' + config.mcpLoadToolName + '，保留原工具并停用该作用域的懒加载')
+      return false
+    }
+    if (typeof gate.tools.register !== 'function') return false
+    try {
+      const definition = defineTool({
+        name: config.mcpLoadToolName,
+        description: '搜索和按需加载 MCP 工具。先用 query 搜索名称或描述（空查询浏览目录），用 offset/limit 分页，再用 names 加载精确工具名。只返回有界目录；成功加载的工具出现在后续请求中。遵守用户及父作用域限制；加载失败会说明原因。',
+        parameters: {
+          query: { type: 'string', description: '可选：工具名、服务器名或描述的关键词；最长 200 字符' },
+          offset: { type: 'integer', description: '可选：从第几个匹配结果开始，默认 0' },
+          limit: { type: 'integer', description: '可选：每页 1–20 条，默认 10' },
+          names: { type: 'array', items: { type: 'string' }, description: '可选：要加载的精确工具名，每次最多 20 个；省略则只搜索' },
+        },
+        output: TEXT_OUTPUT,
+        isConcurrencySafe: () => false,
+        execute: (args, exec) => execute(args, exec),
+      })
+      gate.definition = definition
+      ownedDefinitions.add(definition)
+      const effect = gate.tools.register(definition)
+      if (typeof effect !== 'function') throw Error('register 未返回可撤销句柄')
+      if (!live(gate)) { dispose(effect); return false }
+      gate.metaDisposer = effect
+      return getView(gate.tools, gate.agent)?.visible.get(config.mcpLoadToolName) === definition
     } catch (err) {
-      if (/already registered/i.test(String(err?.message ?? err))) {
-        // 同名已注册(重复事件/作用域残留):视为已注册,不再重试,也不动别人的注册
-        gate.metaRegistered = true
-        gate.metaIndex = indexText
-        return
-      }
-      console.warn(`[dsh-token-optimizer] toolTrim mcp 元工具注册失败:${err?.message ?? err}`)
+      gate.definition = undefined
+      warn('发现工具注册失败，MCP 保持原可见性: ' + (err?.message ?? err))
+      return false
     }
   }
 
-  const onCreated = (payload) => {
-    const agent = payload?.agent
-    const agentCtx = agent?.ctx
-    if (!agentCtx) return
-    const id = agent?.id
-    if (id !== undefined && gates.has(id)) return // 防御重复事件
-
-    const tools = agentCtx.tools
-    if (!tools || typeof tools.restrict !== 'function') {
-      console.warn(`[dsh-token-optimizer] toolTrim: agent "${id ?? '?'}" 作用域拿不到 tools 服务,裁剪未生效`)
-      return
-    }
-
-    const gate = { agent, tools, disposer: undefined, metaDisposer: undefined, allMcp: [], released: new Set() }
-    if (id !== undefined) gates.set(id, gate)
-
-    const view = getView(tools, agent)
-    if (mcpLazy && view) {
-      if (typeof defineTool === 'function') {
-        gate.allMcp = discoverMcp(view, config.mcpPrefix)
-        if (gate.allMcp.length > 0) stats?.bump('toolgate.mcpDetected', 1)
-      } else if (!warnedNoDefineTool) {
-        warnedNoDefineTool = true
-        console.warn('[dsh-token-optimizer] toolTrim mcpLazy 已启用但无法解析 @deepseek-ai/dsh-tools 的 defineTool,mcp 懒加载降级禁用(静态裁剪不受影响)')
+  // Registry and restriction APIs are synchronous in the verified core.
+  // Guard reentrancy because both register/restrict/dispose emit tools/change.
+  function refresh(gate, proposed) {
+    if (!live(gate) || gate.refreshing) return false
+    gate.refreshing = true
+    try {
+      const view = getView(gate.tools, gate.agent)
+      const catalog = new Map()
+      if (config.mcpLazy && (!view || typeof defineTool !== 'function') && !warnedCompatibility) {
+        warnedCompatibility = true
+        warn('缺少可靠 tools.view 或 defineTool，停用懒加载并保留显式静态限制')
       }
-    }
-
-    // 先注册元工具(作用域自注册,restrict 豁免),再挂静态+mcp 拦截
-    registerMetaTool(gate, view).then(() => mountGate(gate, view)).catch(() => {})
-  }
-
-  // mcp 客户端重连会换代工具(tools/change),重新发现 + 重挂 + 刷新索引。
-  // 注意:restrict 本身也会经 admission 变化触发 tools/change——必须先比对
-  // 工具集是否真的变了,不变直接返回,否则死循环(事故教训)。
-  const onToolsChange = () => {
-    for (const gate of gates.values()) {
-      try {
-        const view = getView(gate.tools, gate.agent)
-        if (!view) continue
-        if (!mcpLazy || typeof defineTool !== 'function') continue
-        const allMcp = discoverMcp(view, config.mcpPrefix)
-        const same = allMcp.length === gate.allMcp.length && allMcp.every((n, i) => n === gate.allMcp[i])
-        if (same && [...gate.released].every((n) => allMcp.includes(n))) continue // 无真实变化
-        for (const n of [...gate.released]) if (!allMcp.includes(n)) gate.released.delete(n)
-        gate.allMcp = allMcp
-        if (allMcp.length > 0) {
-          registerMetaTool(gate, view).then(() => mountGate(gate, view)).catch(() => {})
-        } else if (gate.metaDisposer) {
-          disposeGate(gate)
+      if (config.mcpLazy && typeof defineTool === 'function' && view) {
+        // Read global definitions for metadata only: a hidden name stays known.
+        // This never registers or force-allows a global tool.
+        const global = getView(gate.tools, undefined)
+        for (const name of [...view.restrictableNames].sort()) {
+          if (!name.startsWith(config.mcpPrefix) || name === config.mcpLoadToolName) continue
+          const prev = gate.catalog.get(name)
+          const definition = view.visible.get(name) ?? global?.visible.get(name) ?? prev?.definition
+          const globalDefinition = global?.visible.get(name)
+          if (prev && globalDefinition && prev.globalDefinition !== globalDefinition) gate.released.delete(name)
+          catalog.set(name, {
+            definition, globalDefinition,
+            description: definition ? String(definition.description ?? '') : (prev?.description ?? ''),
+          })
         }
-      } catch { /* 单个 gate 失败不影响其他 */ }
-    }
+      }
+      if (!gate.detected && catalog.size) { gate.detected = true; stats?.bump('toolgate.mcpDetected', 1) }
+      gate.catalog = catalog
+      for (const name of gate.released) if (!catalog.has(name) || !allowed(name)) gate.released.delete(name)
+      const nextReleased = new Set([...(proposed ?? gate.released)].filter(name => catalog.has(name) && allowed(name)))
+      let lazyReady = false
+      if (catalog.size && view) lazyReady = registerMeta(gate, view)
+      else dropMeta(gate)
+      if (!live(gate)) return false
+      const ok = mount(gate, view, nextReleased, lazyReady)
+      if (ok) gate.released = nextReleased
+      return ok && lazyReady
+    } finally { gate.refreshing = false }
   }
 
-  const onDisposed = (payload) => {
-    const id = payload?.agent?.id
-    if (id === undefined) return
-    const gate = gates.get(id)
-    if (gate) {
-      disposeGate(gate)
-      gates.delete(id)
+  function execute(args, exec) {
+    const gate = gates.get(exec?.agent?.id)
+    if (!gate || gate.agent !== exec.agent || !live(gate)) return '未找到本会话的 MCP 门控状态，加载未生效'
+    refresh(gate)
+    const input = Array.isArray(args?.names) ? args.names : []
+    const names = [...new Set(input.slice(0, MAX_LOAD).filter(name => typeof name === 'string'))]
+    const before = new Set(gate.released)
+    const proposed = new Set(before)
+    const failed = [], loaded = []
+    for (const name of names) {
+      if (!gate.catalog.has(name)) failed.push({ name: label(name), reason: '未知或已断开' })
+      else if (!allowed(name)) failed.push({ name: label(name), reason: '用户 allow/deny 限制' })
+      else proposed.add(name)
     }
+    const attempted = names.filter(name => gate.catalog.has(name) && allowed(name))
+    const applied = attempted.length ? refresh(gate, proposed) : false
+    const visible = getView(gate.tools, gate.agent)?.visible
+    const rollback = new Set(gate.released)
+    for (const name of attempted) {
+      if (applied && visible?.has(name)) loaded.push(name)
+      else {
+        failed.push({ name: label(name), reason: applied ? '仍受其他作用域限制，尚不可调用' : '加载过滤未生效，请重试' })
+        if (!before.has(name)) rollback.delete(name)
+      }
+    }
+    if ([...gate.released].some(name => !rollback.has(name))) refresh(gate, rollback)
+    const newlyLoaded = loaded.filter(name => !before.has(name)).length
+    if (newlyLoaded) { stats?.bump('toolgate.mcpReleased', newlyLoaded); stats?.bump('toolgate.remounts', 1) }
+    const query = typeof args?.query === 'string' ? args.query.slice(0, 200).toLowerCase() : ''
+    const offset = Number.isSafeInteger(args?.offset) && args.offset > 0 ? args.offset : 0
+    const limit = Number.isSafeInteger(args?.limit) ? Math.max(1, Math.min(MAX_PAGE, args.limit)) : PAGE_SIZE
+    const matches = [...gate.catalog].filter(([name, entry]) => allowed(name) && (name.toLowerCase().includes(query) || entry.description.toLowerCase().includes(query)))
+    const finalView = getView(gate.tools, gate.agent)
+    const items = matches.slice(offset, offset + limit).map(([name, entry]) => ({
+      name: label(name), description: entry.description.replace(/\s+/g, ' ').slice(0, 120),
+      state: finalView?.visible.has(name) ? 'available' : 'unloaded_or_restricted',
+    }))
+    return '已放行: ' + (loaded.map(label).join(', ') || '(无)') + '\n' + JSON.stringify({
+      failed, ignoredNames: Math.max(0, input.length - MAX_LOAD),
+      total: [...gate.catalog.keys()].filter(allowed).length, matched: matches.length, offset, limit,
+      nextOffset: offset + items.length < matches.length && items.length ? offset + items.length : null,
+      items,
+    })
   }
 
+  const onCreated = payload => {
+    const agent = payload?.agent
+    if (closed || agent?.id === undefined || typeof agent.ctx?.tools?.restrict !== 'function') return
+    const previous = gates.get(agent.id)
+    if (previous?.agent === agent) return
+    if (previous) destroy(previous)
+    const gate = { agent, tools: agent.ctx.tools, catalog: new Map(), released: new Set(), dead: false, refreshing: false }
+    gates.set(agent.id, gate)
+    try { refresh(gate) } catch (err) { warn('初始化失败: ' + (err?.message ?? err)) }
+  }
+  const onChange = () => {
+    if (closed) return
+    for (const gate of [...gates.values()]) {
+      try { refresh(gate) } catch (err) { warn('刷新失败: ' + (err?.message ?? err)) }
+    }
+  }
+  const onDisposed = payload => {
+    const gate = gates.get(payload?.agent?.id)
+    if (gate && gate.agent === payload.agent) destroy(gate)
+  }
   ctx.on('agent/created', onCreated)
-  ctx.on('tools/change', onToolsChange)
+  ctx.on('tools/change', onChange)
   ctx.on('agent/disposed', onDisposed)
-
   return () => {
+    if (closed) return
+    closed = true
     ctx.off('agent/created', onCreated)
-    ctx.off('tools/change', onToolsChange)
+    ctx.off('tools/change', onChange)
     ctx.off('agent/disposed', onDisposed)
-    for (const gate of gates.values()) disposeGate(gate)
-    gates.clear()
+    for (const gate of [...gates.values()]) destroy(gate)
   }
 }

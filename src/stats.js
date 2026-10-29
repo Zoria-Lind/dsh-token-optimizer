@@ -5,6 +5,7 @@
 const CHARS_PER_TOKEN = 1.6 // 粗估:DeepSeek 中文约 1.6 字符/token(估算值,实际以 usage 为准)
 
 export function createStats() {
+  const busyAgents = new Set()
   const counters = new Map()
   const samples = []
   const buckets = new Map() // sessionId -> { counters: Map, samples: [] }(T2 按会话分桶)
@@ -88,10 +89,18 @@ export function createStats() {
     snapshot,
     bucket,
     snapshotSession,
+    compressionBusy(agentId) { return busyAgents.has(agentId) },
+    beginCompression(agentId) {
+      if (busyAgents.has(agentId)) return false
+      busyAgents.add(agentId)
+      return true
+    },
+    endCompression(agentId) { busyAgents.delete(agentId) },
     estimateTokens,
     estimateCost,
     formatReport,
     dispose() {
+      busyAgents.clear()
       counters.clear()
       samples.length = 0
       buckets.clear()

@@ -1,225 +1,189 @@
-// 压缩调度器(compactionDriver):在核心 compaction-basic 的触发条件之外,
-// 增加自定义触发源,让长会话的压缩"真正发生"。
-//
-// 为什么需要:核心只在 totalTokens >= 0.8 × contextWindow 时自动压缩;
-// 对 1M 窗口的模型,这个阈值在普通会话里永远够不着(实测峰值 490k 也未触发),
-// 上下文只涨不缩。本模块在 agent 空闲时按自定义压力比(默认 45%)主动调
-// ctx.compaction.compactNow(与 /compact 命令同一路径,要求 agent idle,
-// 摘要替换历史区间,原文留在 append-only 日志,可逆)。
-//
-// 触发状态机(per-agent):
-//   agent/status(idle) → 同步检查 minTurns / maxCompactionsPerSession /
-//   minTokens / pressureRatio 四重闸 → setImmediate 异步执行(让 idle 事件
-//   派发栈先退栈,避免在派发栈内进入 runMaintenance)。
-// 失败分类:
-//   busy/cancelled(ManualCompactionError)→ 回退计数,下次 idle 重试
-//   其余 → failed 计数,不重试(仍受 max 封顶)
-// T3 新增:错误按 err.code 细分记账(failed.<code>);runCompaction 回传结果;
-// computePressure 导出(T4 编排与 T5 命令共用同一口径)。
-
-// 窗口口径(T3/07 §A):tokenMeter.measure() 不返回 contextWindow——窗口只能扫
-// 会话日志里最新的 request/context 事件;取不到则用 fallback 并标记来源
-// (fallback 不是实测值:1e6 与路由默认 262144 差 4 倍,把回落值当实测会整体错位)。
-// 2026-10-04 适配 0.2.0:session.events 已移除,新接口 snapshotEvents();0.1.x 兼容保留
-function sessionEvents(session) {
-  if (typeof session?.snapshotEvents === 'function') {
-    try { return session.snapshotEvents() } catch { return null }
-  }
-  return session?.events ?? null
+// 旧驱动与分层驱动共用压力口径和摘要结果记录；只统计本插件发起的动作。
+export function sessionEvents(session) {
+  try {
+    return typeof session?.snapshotEvents === 'function' ? session.snapshotEvents() : session?.events ?? null
+  } catch { return null }
 }
 
-function latestContextEvent(session) {
-  const events = sessionEvents(session)
-  if (!Array.isArray(events)) return null
-  for (let i = events.length - 1; i >= 0; i--) {
-    const e = events[i]
-    if (e?.type === 'request/context' && typeof e?.data?.contextWindow === 'number') return e
-  }
-  return null
-}
-
-// 上下文窗口:优先读会话日志里最新的 request/context 事件(真实窗口),否则用配置
-function contextWindowOf(session, fallback) {
-  return latestContextEvent(session)?.data.contextWindow ?? fallback
-}
-
-// 压力比统一口径(第一参传 ctx 而非 tokenMeter 实例:调用方都拿得到 ctx,签名统一)。
-// 返回 null 的情况:ctx 上拿不到 tokenMeter / measure 抛错 / totalTokens 非数字。
-// 窗口来源标记 windowSource: 'event'(实测)| 'fallback'(回落值,仅兜底口径)。
 export function computePressure(ctx, session, fallbackWindow = 262144) {
-  let meter
   try {
-    meter = ctx?.get?.('tokenMeter')
-  } catch {
-    return null
-  }
-  if (!meter || typeof meter.measure !== 'function') return null
-  let totalTokens
+    const totalTokens = ctx?.get?.('tokenMeter')?.measure(session)?.totalTokens
+    if (!Number.isFinite(totalTokens) || totalTokens < 0) return null
+    const events = sessionEvents(session)
+    let event
+    if (Array.isArray(events)) {
+      for (let i = events.length - 1; i >= 0; i--) {
+        const e = events[i]
+        if (e?.type === 'request/context' && Number.isFinite(e?.data?.contextWindow) && e.data.contextWindow > 0) { event = e; break }
+      }
+    }
+    const window = event?.data.contextWindow ?? fallbackWindow
+    if (!Number.isFinite(window) || window <= 0) return null
+    return { totalTokens, window, windowSource: event ? 'event' : 'fallback', ratio: totalTokens / window }
+  } catch { return null }
+}
+
+export function bumpCompression(stats, agent, key, delta = 1) {
+  stats?.bump(key, delta)
+  stats?.bucket(agent.id).bump(key, delta)
+}
+
+export function recordCompression(stats, agent, controller, stage, status, detail = {}) {
+  stats?.bucket(agent.id).addSample({
+    module: 'compression', controller, stage, status, at: new Date().toISOString(),
+    modelCall: false, archive: 'not-implemented', ...detail,
+  })
+}
+
+// 30 秒内，同一份历史上的无效摘要不重复提交；不消耗成功配额。
+export function retryKey(session, pressure) {
+  const events = sessionEvents(session)
+  return JSON.stringify([pressure.totalTokens, pressure.window, events?.length, events?.at(-1)?.seq])
+}
+
+export async function runSummary({ agent, state, controller, timeoutMs, compaction, meter, before, stats, alive }) {
+  const prefix = controller === 'layered' ? 'layeredCompact' : 'compactionDriver'
+  const started = Date.now()
+  const abort = new AbortController()
+  state.abort = abort
+  const timer = setTimeout(() => abort.abort(new DOMException('压缩超时', 'TimeoutError')), timeoutMs)
+  timer.unref?.()
+  const details = () => ({
+    startedAt: new Date(started).toISOString(), durationMs: Date.now() - started,
+    before, after: computePressure({ get: () => meter }, agent.session, before.window),
+  })
+  bumpCompression(stats, agent, prefix + (controller === 'layered' ? '.attempts' : '.triggers'))
+  recordCompression(stats, agent, controller, 'summary', 'running', { before, modelCall: null })
   try {
-    totalTokens = meter.measure(session)?.totalTokens
-  } catch {
-    return null
+    const result = await compaction.compactNow(agent, abort.signal)
+    if (!alive()) return { ok: false, code: 'disposed' }
+    if (result === null) {
+      bumpCompression(stats, agent, prefix + (controller === 'layered' ? '.noop' : '.code.noop'))
+      recordCompression(stats, agent, controller, 'summary', 'noop', details())
+      return { ok: false, code: 'noop' }
+    }
+    if (typeof result !== 'object' || Array.isArray(result)) {
+      throw Object.assign(new Error('compactNow 未返回有效结果'), { code: 'result' })
+    }
+    bumpCompression(stats, agent, prefix + (controller === 'layered' ? '.lossy' : '.completed'))
+    recordCompression(stats, agent, controller, 'summary', 'success', { ...details(), modelCall: true })
+    return { ok: true }
+  } catch (err) {
+    if (!alive()) return { ok: false, code: 'disposed' }
+    const code = abort.signal.reason?.name === 'TimeoutError' || err?.name === 'TimeoutError' ? 'timeout' : err?.code ?? 'unknown'
+    if (controller === 'legacy' && (code === 'busy' || code === 'cancelled')) {
+      bumpCompression(stats, agent, 'compactionDriver.skippedBusy')
+      bumpCompression(stats, agent, 'compactionDriver.code.' + code)
+    } else {
+      bumpCompression(stats, agent, prefix + '.failed.' + code)
+      if (controller === 'legacy') bumpCompression(stats, agent, prefix + '.failed')
+    }
+    recordCompression(stats, agent, controller, 'summary', code, { ...details(), modelCall: null })
+    return { ok: false, code }
+  } finally {
+    clearTimeout(timer)
+    state.abort = null
   }
-  if (typeof totalTokens !== 'number') return null
-  const event = latestContextEvent(session)
-  const window = event ? event.data.contextWindow : fallbackWindow
+}
+
+// 可选注入服务；返回的 dispose 会释放注入监听。卸载后不再接收晚到服务。
+export function compressionServices(ctx, names) {
+  const services = {}
+  let alive = true
+  let dispose
+  try {
+    dispose = ctx.inject?.(names, (svc) => {
+      if (!alive) return
+      for (const name of names) services[name] = svc[name]
+    })
+  } catch { /* 缺少服务时状态明确显示 unavailable */ }
   return {
-    totalTokens,
-    window,
-    windowSource: event ? 'event' : 'fallback',
-    ratio: window > 0 ? totalTokens / window : 0,
+    get(name, agent) {
+      if (!alive) return undefined
+      // 摘要和清理属于当前 Agent 的隔离预设；不能缓存或借用其他预设。
+      if (agent && (name === 'compaction' || name === 'toolResultPruner')) {
+        try {
+          const presets = ctx.get?.('agentPresets')
+          if (typeof presets?.serviceFor === 'function') {
+            const scoped = presets.serviceFor(agent, name)
+            if (scoped !== undefined || presets.composedPreset?.(agent.ctx) !== undefined) return scoped
+          }
+        } catch { return undefined } // 解析失败时不退到可能属于其他配置的服务
+      }
+      if (!services[name]) {
+        try { services[name] = ctx.get?.(name) } catch { /* 无注入权限 */ }
+      }
+      return services[name]
+    },
+    dispose() { alive = false; if (typeof dispose === 'function') dispose() },
   }
 }
 
 export function createCompactionDriverModule(ctx, config, stats) {
-  if (!config?.enabled) return () => {}
-  if (!ctx || typeof ctx.on !== 'function') return () => {}
-
-  // cordis 服务获取:ctx.get 在未声明 inject 时会抛"cannot get without inject"
-  // (真实事故:被 catch 吞掉后永远拿不到服务)。正解 = ctx.inject(behaviorPrompt
-  // 同款模式,服务可用时回调执行,晚激活也没关系)。保留 ctx.get 兜底供 smoke
-  // 测试与非常规 ctx 使用。
-  let compaction
-  let tokenMeter
-  let servicesWarned = false
-  let servicesReadyLogged = false
-
-  try {
-    ctx.inject?.(['compaction', 'tokenMeter'], (sctx) => {
-      if (!compaction) compaction = sctx.compaction
-      if (!tokenMeter) tokenMeter = sctx.tokenMeter
-      const ok = !!compaction && typeof compaction.compactNow === 'function' && !!tokenMeter && typeof tokenMeter.measure === 'function'
-      if (ok && !servicesReadyLogged) {
-        servicesReadyLogged = true
-        console.log('[dsh-token-optimizer] compactionDriver 服务就绪(compaction + tokenMeter 已取得),触发判定生效')
-      }
-    })
-  } catch (err) {
-    console.warn('[dsh-token-optimizer] compactionDriver inject 注册失败: ' + (err?.message ?? err))
-  }
-
-  function ensureServices(agent) {
-    if (compaction && typeof compaction.compactNow === 'function' && tokenMeter && typeof tokenMeter.measure === 'function') return true
-    try {
-      if (typeof ctx.get === 'function') {
-        if (!compaction) compaction = ctx.get('compaction')
-        if (!tokenMeter) tokenMeter = ctx.get('tokenMeter')
-      }
-    } catch (err) {
-      console.warn('[dsh-token-optimizer] compactionDriver ctx.get 抛错: ' + (err?.message ?? err))
-    }
-    const ok = !!compaction && typeof compaction.compactNow === 'function' && !!tokenMeter && typeof tokenMeter.measure === 'function'
-    if (ok && !servicesReadyLogged) {
-      servicesReadyLogged = true
-      console.log('[dsh-token-optimizer] compactionDriver 服务就绪(compaction + tokenMeter 已取得),触发判定生效')
-    } else if (!ok && !servicesWarned) {
-      servicesWarned = true
-      console.warn('[dsh-token-optimizer] compactionDriver 尚未取得 compaction/tokenMeter 服务,将在每次 agent idle 时重试(注意:web 部署需在 profile cordis.patch.yml 重新启用被 dsh-web-app 禁用的 compaction-basic 行)')
-    }
-    return ok
-  }
-
-  const listeners = []
-  const states = new Map() // agentId -> { inFlight, compactionsDone }
-  let warnedNoEvents = false
-
-  function turnCountOf(session) {
-    const events = sessionEvents(session)
-    if (!Array.isArray(events)) {
-      if (!warnedNoEvents) {
-        warnedNoEvents = true
-        console.warn('[dsh-token-optimizer] compactionDriver 无法读取 session.events,触发判断不可用(探针阶段请核对会话对象形状)')
-      }
-      return 0
-    }
-    let n = 0
-    for (const e of events) if (e?.type === 'turn/start') n += 1
-    return n
-  }
-
-  async function runCompaction(agent, state) {
-    const signal = AbortSignal.timeout(config.timeoutMs)
-    try {
-      stats?.bump('compactionDriver.triggers', 1)
-      const result = await compaction.compactNow(agent, signal)
-      if (result === null) {
-        // 无可用压缩区段:计为已用次数,不立即重试(防每轮空转),由 max 封顶
-        stats?.bump('compactionDriver.code.noop', 1)
-        return { ok: false, code: 'noop' }
-      }
-      stats?.bump('compactionDriver.completed', 1)
-      console.log(`[dsh-token-optimizer] compactionDriver 压缩完成:agent "${agent?.id ?? '?'}" 历史已替换为摘要(原文可回放)`)
-      return { ok: true }
-    } catch (err) {
-      const code = err?.code
-      if (code === 'busy' || code === 'cancelled') {
-        // 与用户手动 /compact 并发(busy)或本插件超时/中止(cancelled):
-        // 回退计数,下次 idle 重试。注意:AbortSignal.timeout 的超时是普通 abort,
-        // 不是 cancelled(cancelled 只在 agent 自身信号中止时出现,07 §A)
-        stats?.bump('compactionDriver.skippedBusy', 1)
-        stats?.bump(`compactionDriver.code.${code}`, 1)
-        state.compactionsDone = Math.max(0, state.compactionsDone - 1)
-        return { ok: false, code }
-      }
-      // 按 err.code 细分记账(busy/cancelled/changed/summary/commit/persistence),
-      // 不再用一个笼统 failed 把"一次都没压过"伪装成"刚压过"
-      stats?.bump('compactionDriver.failed', 1)
-      stats?.bump(`compactionDriver.failed.${code ?? 'unknown'}`, 1)
-      console.warn(`[dsh-token-optimizer] compactionDriver 压缩失败(${code ?? 'unknown'}):${err?.message ?? err}`)
-      return { ok: false, code: code ?? 'unknown' }
-    } finally {
-      state.inFlight = false
-    }
-  }
-
+  if (typeof config !== 'function' && !config?.enabled) return () => {}
+  if (typeof ctx?.on !== 'function') return () => {}
+  const read = typeof config === 'function' ? config : () => config
+  const services = compressionServices(ctx, ['compaction', 'tokenMeter'])
+  const states = new Map()
+  let active = true
   const onStatus = (payload) => {
     const agent = payload?.agent
-    if (!agent || payload?.status !== 'idle') return
-    if (!ensureServices(agent)) return
-    const session = agent.session
-    if (!session) return
-
-    let state = states.get(agent.id)
-    if (!state) {
-      state = { inFlight: false, compactionsDone: 0 }
-      states.set(agent.id, state)
-    }
-    if (state.inFlight) return
-    if (state.compactionsDone >= config.maxCompactionsPerSession) return
-    if (turnCountOf(session) < config.minTurns) return
-
-    let totalTokens
-    try {
-      const m = tokenMeter.measure(session)
-      totalTokens = m?.totalTokens
-    } catch {
-      return
-    }
-    if (typeof totalTokens !== 'number' || totalTokens < config.minTokens) return
-
-    const window = contextWindowOf(session, config.contextWindow)
-    if (window <= 0 || totalTokens / window < config.pressureRatio) return
-
-    stats?.bump('compactionDriver.checks', 1)
-    state.inFlight = true
-    state.compactionsDone += 1
-    // 让 idle 事件派发栈先退栈,再进入 runMaintenance
-    setImmediate(() => {
-      runCompaction(agent, state).catch(() => {})
+    if (!active || !agent?.session || payload.status !== 'idle') return
+    const cfg = read() // 本次检查的不可变快照
+    if (!cfg?.enabled) return
+    const note = (status, detail) => recordCompression(stats, agent, 'legacy', 'check', status, detail)
+    let st = states.get(agent.id)
+    if (!st) states.set(agent.id, st = { busy: false, done: 0, retryAt: 0 })
+    if (st.busy || stats?.compressionBusy(agent.id)) return
+    const meter = services.get('tokenMeter')
+    const compaction = services.get('compaction', agent)
+    if (!meter?.measure || !compaction?.compactNow) { note('unavailable'); return }
+    const p = computePressure({ get: () => meter }, agent.session, cfg.contextWindow)
+    if (!p) { note('noPressure'); return }
+    if (st.done >= cfg.maxCompactionsPerSession) { note('limit', { before: p }); return }
+    const events = sessionEvents(agent.session)
+    if (!Array.isArray(events)) { note('noHistory', { before: p }); return }
+    if (events.filter((e) => e?.type === 'turn/start').length < cfg.minTurns) { note('minTurns', { before: p }); return }
+    if (p.totalTokens < cfg.minTokens || p.ratio < cfg.pressureRatio) { note('below', { before: p }); return }
+    const key = retryKey(agent.session, p)
+    if (key === st.retryKey && Date.now() < st.retryAt) { note('backoff', { before: p }); return }
+    if (stats && !stats.beginCompression(agent.id)) return
+    st.busy = true
+    setImmediate(async () => {
+      try {
+        if (!active || states.get(agent.id) !== st || !read()?.enabled) {
+          if (active) note('cancelled')
+          return
+        }
+        bumpCompression(stats, agent, 'compactionDriver.checks')
+        const result = await runSummary({
+          agent, state: st, controller: 'legacy', timeoutMs: cfg.timeoutMs,
+          compaction, meter, before: p, stats, alive: () => active && states.get(agent.id) === st,
+        })
+        if (result.ok) st.done += 1
+        else if (!['busy', 'cancelled', 'disposed'].includes(result.code)) {
+          st.retryKey = key
+          st.retryAt = Date.now() + 30000
+        }
+      } finally {
+        st.busy = false
+        stats?.endCompression(agent.id)
+      }
     })
   }
-
-  const onDisposed = (payload) => {
-    const agent = payload?.agent
-    if (agent?.id !== undefined) states.delete(agent.id)
+  const onDisposed = ({ agent } = {}) => {
+    const st = states.get(agent?.id)
+    st?.abort?.abort(new DOMException('会话已关闭', 'AbortError'))
+    states.delete(agent?.id)
   }
-
   ctx.on('agent/status', onStatus)
-  listeners.push(() => ctx.off('agent/status', onStatus))
   ctx.on('agent/disposed', onDisposed)
-  listeners.push(() => ctx.off('agent/disposed', onDisposed))
   return () => {
+    active = false
+    for (const st of states.values()) st.abort?.abort(new DOMException('插件已卸载', 'AbortError'))
     states.clear()
-    for (const off of listeners) off()
+    services.dispose()
+    ctx.off?.('agent/status', onStatus)
+    ctx.off?.('agent/disposed', onDisposed)
   }
 }

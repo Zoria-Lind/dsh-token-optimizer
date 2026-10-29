@@ -1,6 +1,9 @@
+import { isAbsolute } from 'node:path'
+
 // 配置默认值与校验。与方案文档 4.1 的 YAML 结构对齐,但只保留真实落地的键。
 
 export const DEFAULT_CONFIG = {
+  archive: { enabled: false, directory: '', previousDirectories: [], retryGeneration: 0 },
   // ===== 第1层:输入预处理 =====
   // 长文本→图片:超长自然语言文本渲染成图,经 vision API 读图得摘要后以文字替换进上下文。
   // 可靠性修复(2026-09-03 对照实验):flash-vision-exp 读"高密度大页"会整篇脑补
@@ -76,13 +79,13 @@ export const DEFAULT_CONFIG = {
     timeoutMs: 120000,             // 单次压缩超时
   },
   // ===== T4 分层压缩编排(0C 修正版:L0 观测 / L1 无损 prune / L2 有损 compactNow) =====
-  // 默认 enabled:false(灰度)。启用时必须同时把 compactionDriver.enabled 设为 false:
+  // 默认 enabled:false(灰度)。分层启用时运行端旁路旧驱动；设置页切换会原子保存两个开关:
   // 旧驱动 0.45 命中即有损,会把 L1 的无损机会整个吃掉(内核 compaction-basic 本来是
   // "测阈 → prune → 复测 → 仍超阈才有损"的两段式)。
   layeredCompact: {
     enabled: false,
     lowRatio: 0.4,                 // L0 观测层触发线(不降压力,只记账,禁止包装成"无损压缩")
-    midRatio: 0.5,                 // L1 无损层触发线(ctx.toolResultPruner.pruneSession,真降分子)
+    midRatio: 0.5,                 // L1 工具历史清理触发线(ctx.toolResultPruner.pruneSession,真降分子)
     highRatio: 0.65,               // L2 有损层触发线(compactNow;必须用 L1 复测后的 ratio 判定)
     highTierTimeoutMs: 120000,     // compactNow 超时(AbortSignal.timeout;超时不是 cancelled)
     highTierMaxPerSession: 2,      // 每会话有损压缩上限
@@ -94,8 +97,9 @@ export const DEFAULT_CONFIG = {
     },
   },
   // 结果缓存
+  // 暂停结果缓存：只读搜索仍依赖可变文件状态；旧 enabled:true 也不复用结果。
   cache: {
-    enabled: true,
+    enabled: false,
     ttl: 3600,
   },
   // ===== 监控 =====
@@ -103,9 +107,9 @@ export const DEFAULT_CONFIG = {
     enabled: true,
     showInChat: true,          // 会话结束时输出节省统计
   },
-  // ===== 新增:重复读文件 → 增量 diff =====
+  // ===== fileDiff 暂停：旧配置兼容保留，不能证明请求仍有基线时始终返回原文 =====
   fileDiff: {
-    enabled: true,
+    enabled: false,
     tools: ['read'],
     minSize: 2048,
     maxFileBytes: 200000,
@@ -113,10 +117,10 @@ export const DEFAULT_CONFIG = {
     collapseUnchanged: true,
   },
   // ===== 工具 schema 按会话裁剪(默认关闭;启用后经 agent/created 对每个 agent 作用域生效) =====
-  // v2 新增 mcpLazy:mcp__* 工具默认全部拦截,经 mcp_load_tools 元工具按名放行(无 MCP 部署自动 no-op)
+  // mcpLazy：发现工具注册成功后才隐藏 MCP，支持目录搜索/分页及按名加载；保留显式限制。
   toolTrim: {
     enabled: false,
-    allow: [],
+    allow: null,               // null/省略=不限；[]=禁止所有继承工具
     deny: [],
     mcpLazy: true,              // MCP 工具懒加载(检测不到 mcp__* 工具时静默 no-op)
     mcpPrefix: 'mcp__',         // MCP 工具名前缀(dsh-mcp-client 的公开名格式)
@@ -135,7 +139,7 @@ export const DEFAULT_CONFIG = {
 }
 
 const NUMERIC_KEYS = new Set([
-  'threshold', 'compressionRate', 'preserveHeadTail', 'ttl',
+  'retryGeneration', 'threshold', 'compressionRate', 'preserveHeadTail', 'ttl',
   'maxSummaryChars', 'headLines', 'tailLines', 'sampleInterval',
   'minSize', 'maxFileBytes', 'contextLines',
   'structureThreshold', 'shellThreshold', 'errorSummaryChars', 'spillBytes',
@@ -145,8 +149,8 @@ const NUMERIC_KEYS = new Set([
   // T4 分层压缩扁平键( NUMERIC_KEYS 是全局扁平集合,子键名不得与既有键重名 )
   'lowRatio', 'midRatio', 'highRatio', 'highTierTimeoutMs', 'highTierMaxPerSession', 'sessionWindowFallback',
 ])
-const STRING_KEYS = new Set(['visionModel', 'baseUrl', 'prompt', 'sync_dir', 'compression_strategy'])
-const STRING_ARRAY_KEYS = new Set(['tools', 'allow', 'deny', 'shellTools', 'readTools'])
+const STRING_KEYS = new Set(['directory', 'visionModel', 'baseUrl', 'prompt', 'sync_dir', 'compression_strategy'])
+const STRING_ARRAY_KEYS = new Set(['previousDirectories', 'tools', 'allow', 'deny', 'shellTools', 'readTools'])
 
 // 结构化值校验(超出数字/字符串/布尔的基础校验)
 const CUSTOM_VALIDATORS = {
@@ -198,6 +202,10 @@ function assertNumber(name, value, { min = 0, max = Infinity } = {}) {
 }
 
 function resolveSection(section, defaults) {
+  section = unwrapConfig(section)
+  if (section !== undefined && (section === null || typeof section !== 'object' || Array.isArray(section))) {
+    throw new Error('dsh-token-optimizer config: section must be an object')
+  }
   const out = { ...defaults }
   if (section && typeof section === 'object') {
     for (const [key, value] of Object.entries(section)) {
@@ -209,6 +217,8 @@ function resolveSection(section, defaults) {
           assertNumber(key, value, { min: 0, max: 1 })
         } else if (key === 'maxSummaryRatio') assertNumber(key, value, { min: 0.1, max: 1 })
         else assertNumber(key, value)
+      } else if (key === 'allow' && value === null) {
+        // Explicit unrestricted policy, distinct from an empty whitelist.
       } else if (STRING_ARRAY_KEYS.has(key)) {
         if (!Array.isArray(value) || value.some((item) => typeof item !== 'string')) {
           throw new Error(`dsh-token-optimizer config: "${key}" must be an array of strings`)
@@ -233,6 +243,44 @@ function resolveSection(section, defaults) {
 // v1 退役节:用户配置里遗留时静默忽略 + 提示(绝不抛错——抛错会炸整个插件树)
 const LEGACY_SECTIONS = new Set(['compress', 'sample', 'pruning', 'dedup'])
 
+export function unwrapConfig(value) {
+  return value && typeof value.get === 'function' ? value.get() : value
+}
+
+// 同时供启动、每次 idle 与 /token-status 使用；不改其它已冻结的模块配置。
+export function resolveCompressionConfig(config = {}) {
+  const compactionDriver = resolveSection(config.compactionDriver, DEFAULT_CONFIG.compactionDriver)
+  const layeredCompact = resolveSection(config.layeredCompact, DEFAULT_CONFIG.layeredCompact)
+  const { lowRatio: low, midRatio: mid, highRatio: high } = layeredCompact
+  if (!(0 < low && low <= mid && mid < high && high < 1)) {
+    throw new Error('压缩阈值必须满足 0 < 观测线 ≤ 清理线 < 摘要线 < 100%')
+  }
+  if (!(0 < compactionDriver.pressureRatio && compactionDriver.pressureRatio < 1)) {
+    throw new Error('旧驱动阈值必须大于 0% 且小于 100%')
+  }
+  for (const [name, section, timeout, limit, window] of [
+    ['compactionDriver', compactionDriver, 'timeoutMs', 'maxCompactionsPerSession', 'contextWindow'],
+    ['layeredCompact', layeredCompact, 'highTierTimeoutMs', 'highTierMaxPerSession', 'sessionWindowFallback'],
+  ]) {
+    if (!Number.isInteger(section[timeout]) || section[timeout] < 1 || section[timeout] > 2147483647) throw new Error(name + ' timeout must be a positive 32-bit integer')
+    if (!Number.isInteger(section[limit]) || section[limit] < 0) throw new Error(name + ' limit must be a non-negative integer')
+    if (!(section[window] > 0)) throw new Error(name + ' window must be positive')
+  }
+  return Object.freeze({ compactionDriver, layeredCompact })
+}
+
+export function resolveArchiveConfig(config = {}) {
+  const value = resolveSection(unwrapConfig(config)?.archive, DEFAULT_CONFIG.archive)
+  if (value.enabled && (!value.directory.trim() || !isAbsolute(value.directory))) throw new Error('归档启用时必须指定绝对目录路径')
+  if (value.previousDirectories.some(dir => !isAbsolute(dir))) throw new Error('历史归档目录必须是绝对路径')
+  if (!Number.isSafeInteger(value.retryGeneration) || value.retryGeneration < 0) throw new Error('归档重试计数必须为非负整数')
+  return Object.freeze({ ...value, previousDirectories: Object.freeze([...value.previousDirectories]) })
+}
+
+export function compressionMode(config) {
+  return config.layeredCompact.enabled ? 'layered' : config.compactionDriver.enabled ? 'legacy' : 'off'
+}
+
 export function resolveConfig(config = {}) {
   if (typeof config !== 'object' || config === null) config = {}
   for (const name of LEGACY_SECTIONS) {
@@ -241,14 +289,14 @@ export function resolveConfig(config = {}) {
     }
   }
   return Object.freeze({
+    archive: resolveArchiveConfig(config),
     text2img: resolveSection(config.text2img, DEFAULT_CONFIG.text2img),
     cache: resolveSection(config.cache, DEFAULT_CONFIG.cache),
     monitor: resolveSection(config.monitor, DEFAULT_CONFIG.monitor),
     fileDiff: resolveSection(config.fileDiff, DEFAULT_CONFIG.fileDiff),
     toolTrim: resolveSection(config.toolTrim, DEFAULT_CONFIG.toolTrim),
     outputLadder: resolveSection(config.outputLadder, DEFAULT_CONFIG.outputLadder),
-    compactionDriver: resolveSection(config.compactionDriver, DEFAULT_CONFIG.compactionDriver),
-    layeredCompact: resolveSection(config.layeredCompact, DEFAULT_CONFIG.layeredCompact),
+    ...resolveCompressionConfig(config),
     // 占位节:enabled=false 时无模块消费,仅保证配置合法(阶段 3b 后开开关)
     memory_bridge: resolveSection(config.memory_bridge, DEFAULT_CONFIG.memory_bridge),
   })
